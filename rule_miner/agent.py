@@ -148,9 +148,40 @@ async def _run_async(state: MiningState) -> None:
 
 
 def _log(message: object) -> None:
+    """Surface every SDK message: type + content blocks + tool calls."""
+    msg_type = type(message).__name__
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            block_type = type(block).__name__
+            text = getattr(block, "text", None)
+            if text:
+                print(f"[{msg_type}/{block_type}] {text}")
+                continue
+            tool_name = getattr(block, "name", None)
+            if tool_name:
+                tool_input = getattr(block, "input", None)
+                input_summary = (
+                    str(tool_input)[:300] if tool_input is not None else ""
+                )
+                print(f"[{msg_type}/{block_type}] tool={tool_name} input={input_summary}")
+                continue
+            tool_result = getattr(block, "content", None)
+            if tool_result is not None:
+                result_summary = str(tool_result)[:300]
+                print(f"[{msg_type}/{block_type}] result={result_summary}")
+                continue
+            print(f"[{msg_type}/{block_type}] {block!r}")
+        return
     text = getattr(message, "text", None)
     if text:
-        print(text)
+        print(f"[{msg_type}] {text}")
+        return
+    result = getattr(message, "result", None)
+    if result is not None:
+        print(f"[{msg_type}] result={str(result)[:500]}")
+        return
+    print(f"[{msg_type}] {message!r}")
 
 
 def run(state: MiningState) -> None:
