@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trustabl-rule-miner"
+version = "0.1.0"
+description = "Mines official agent-SDK sample repos for new policy-rule candidates and drafts them as GitHub issues for human review."
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+rule-miner = "rule_miner.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["rule_miner*"]
