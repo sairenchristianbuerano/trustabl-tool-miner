@@ -101,17 +101,19 @@ def cli() -> int:
     parser.add_argument(
         "--max-targets",
         type=int,
-        default=3,
+        default=None,
         help="Cap on number of target repos scanned per run (default 3). "
         "Applied after --discover merge. Set to 0 for no cap. Keeps disk "
-        "usage bounded.",
+        "usage bounded. When set explicitly, --max-runtime-seconds "
+        "auto-disables (the repo cap is treated as authoritative).",
     )
     parser.add_argument(
         "--max-runtime-seconds",
         type=int,
-        default=300,
+        default=None,
         help="Stop the scan loop once total wall clock exceeds this many "
-        "seconds (default 300 = 5 min). 0 disables.",
+        "seconds (default 300 = 5 min). 0 disables. Auto-disabled when "
+        "--max-targets is set explicitly.",
     )
     parser.add_argument(
         "--no-skip-scanned",
@@ -126,6 +128,17 @@ def cli() -> int:
         "game again.",
     )
     args = parser.parse_args()
+
+    explicit_max_targets = args.max_targets is not None
+    if args.max_targets is None:
+        args.max_targets = 3
+    if args.max_runtime_seconds is None:
+        args.max_runtime_seconds = 0 if explicit_max_targets else 300
+    if explicit_max_targets:
+        print(
+            "  --max-targets set explicitly -- runtime cap disabled",
+            file=sys.stderr,
+        )
 
     trustabl_enabled = (
         args.use_trustabl == "on"
