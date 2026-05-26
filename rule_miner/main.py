@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -232,6 +234,7 @@ def cli() -> int:
     all_records = []
     all_agents: list = []
     all_subagents: list = []
+    clones_to_clean: list[Path] = []
     deadline = (
         time.monotonic() + args.max_runtime_seconds
         if args.max_runtime_seconds > 0
@@ -289,9 +292,7 @@ def cli() -> int:
                 subagents=len(tr_subagents),
             )
             if not args.keep_clones:
-                shutil.rmtree(clone_path, ignore_errors=True)
-                print(f"  {tgt['repo']}: cleaned clone {clone_path}",
-                      file=sys.stderr)
+                clones_to_clean.append(clone_path)
             if hb:
                 hb.add_counts(
                     tools=len(records),
@@ -308,15 +309,20 @@ def cli() -> int:
     if not candidates:
         print("no uncovered patterns crossed the threshold; nothing to draft.",
               file=sys.stderr)
+        _cleanup_clones(clones_to_clean)
         return 0
 
-    # Step 6: hand off to agent
+    # Step 6: hand off to agent. Clones MUST stay on disk through this step
+    # so the agent's read_callsite tool can ground rule drafts in real code.
     state = MiningState(
         repo_root=rules_repo_path.resolve(),
         dry_run=args.dry_run,
         candidates=candidates,
     )
-    agent.run(state)
+    try:
+        agent.run(state)
+    finally:
+        _cleanup_clones(clones_to_clean)
 
     print(f"\nwrote {len(state.written_rules)} rules:")
     for rule_id, path in state.written_rules:
@@ -326,6 +332,34 @@ def cli() -> int:
         "per trustabl-rules CLAUDE.md step 5."
     )
     return 0
+
+
+def _cleanup_clones(paths: list[Path]) -> None:
+    for p in paths:
+        if not p.exists():
+            continue
+        _rmtree_force(p)
+        if p.exists():
+            print(f"  WARNING: could not fully remove {p}", file=sys.stderr)
+        else:
+            print(f"  cleaned clone {p}", file=sys.stderr)
+
+
+def _rmtree_force(path: Path) -> None:
+    """rmtree that handles Windows read-only files inside `.git`.
+
+    shutil.rmtree fails on .git/objects/pack/*.idx etc. without this
+    onerror callback. Without it the dir is silently left half-deleted
+    and the next git fetch trips on `fatal: not a git repository`.
+    """
+    def onerror(func, target, exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=onerror)
 
 
 def _resolve_rules_repo(explicit: Path | None) -> Path | None:
@@ -363,7 +397,7 @@ def _sweep_orphan_clones(scanned_keys: set[str]) -> None:
             continue
         repo = entry.name.replace("__", "/", 1)
         if repo in scanned_repos:
-            shutil.rmtree(entry, ignore_errors=True)
+            _rmtree_force(entry)
             swept += 1
     if swept:
         print(f"  swept {swept} orphan clones from {CACHE_ROOT}",
