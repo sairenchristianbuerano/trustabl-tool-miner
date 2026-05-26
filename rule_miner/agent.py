@@ -61,16 +61,41 @@ async def _t_read_callsite(args: dict) -> dict:
 
 @tool(
     "write_rule_yaml",
-    "Validate a rule draft and append it to <rules_repo>/<sdk_dir>/<topic>.yaml. "
-    "Creates the topic file if absent. `draft` must include id, title, "
-    "severity (low|medium|high), confidence (0..1), applies_to (list), match "
-    "(dict), explanation (str), fix (str), and sdk (openai_agents | "
-    "claude_agent_sdk | google_adk). `topic` is the bare filename stem (no "
-    "slashes, no .yaml). Returns WROTE / DRY_RUN / REJECTED.",
-    {"draft": dict, "topic": str},
+    "Write a rule + its paired rationale doc per the trustabl-rules "
+    "template guide. Appends YAML to <rules_repo>/<sdk_dir>/<topic>.yaml "
+    "AND writes the matching <rules_repo>/docs/Policy/<sdk_dir>/<topic>.md "
+    "(template at docs/policy-rationale-doc-template-guide.md). "
+    "`draft`: id, title, severity (low|medium|high), confidence (0..1), "
+    "applies_to (list), match (dict), explanation (str), fix (str), sdk "
+    "(openai_agents|claude_agent_sdk|google_adk), language (optional, "
+    "default python). `topic`: bare filename stem. `rationale_md`: full "
+    "Markdown body BELOW the metadata block — 'What this policy covers', "
+    "'Why <topic> is a distinct concern in agent tools' (threat model), "
+    "'Rule-by-rule defense' with rule_id as H3 plus 'What we detect / Why "
+    "it is flaggable / Real-world consequence (with specific callsite "
+    "URLs like https://github.com/owner/repo/blob/main/file.py#L42) / Why "
+    "severity is X and not Y / Fix type / Confidence Z', 'What this "
+    "policy does not cover', 'Recommendations beyond the fix' with a full "
+    "safe-code example. `owasp_refs`: list of OWASP LLM Top 10:2025 IDs "
+    "(LLM01-LLM10) anchoring the rule. `fix_type`: 'config' or 'code'. "
+    "Returns WROTE / DRY_RUN / REJECTED.",
+    {
+        "draft": dict,
+        "topic": str,
+        "rationale_md": str,
+        "owasp_refs": list,
+        "fix_type": str,
+    },
 )
 async def _t_write_rule(args: dict) -> dict:
-    result = miner_tools.write_rule_yaml(_state(), args["draft"], args["topic"])
+    result = miner_tools.write_rule_yaml(
+        _state(),
+        args["draft"],
+        args["topic"],
+        rationale_md=args.get("rationale_md"),
+        owasp_refs=args.get("owasp_refs"),
+        fix_type=args.get("fix_type", "code"),
+    )
     return {"content": [{"type": "text", "text": result}]}
 
 
@@ -101,7 +126,15 @@ For each candidate:
          map: {SDK_TO_TOOL_TOKEN}.
        - `severity`, `confidence`, `match`, `explanation`, `fix`: per
          the authoring contract below.
-  4. Call write_rule_yaml(draft, topic). On REJECTED, fix the reported
+  4. Compose the rationale Markdown body per the template (every section,
+     no skips). Inside "Real-world consequence" cite at least two
+     callsites with full GitHub URLs of the form
+     https://github.com/<repo>/blob/<ref>/<file_path>#L<line> built from
+     the list_candidate_patterns examples. Pick OWASP LLM Top 10:2025 IDs
+     anchoring the rule (LLM01..LLM10). Decide fix_type ('config' if the
+     fix is hooks/guardrails/sandbox/agent kwargs, 'code' if it requires
+     tool source edits). Then call write_rule_yaml(draft, topic,
+     rationale_md, owasp_refs, fix_type). On REJECTED, fix the reported
      issue and retry once; if still rejected, skip and move on.
 
 Stop when every candidate has been processed. Print a final summary

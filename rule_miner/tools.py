@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -68,11 +69,37 @@ def read_callsite(file: str, line: int, span: int = 30) -> str:
     return "\n".join(numbered)
 
 
-def write_rule_yaml(state: MiningState, draft: dict, topic: str) -> str:
-    """Validate `draft` and append it to <rules_repo>/<sdk_dir>/<topic>.yaml.
+def write_rule_yaml(
+    state: MiningState,
+    draft: dict,
+    topic: str,
+    rationale_md: str | None = None,
+    owasp_refs: list[str] | None = None,
+    fix_type: str = "code",
+) -> str:
+    """Validate `draft`, append it to <rules_repo>/<sdk_dir>/<topic>.yaml,
+    AND write the paired rationale doc at
+    <rules_repo>/docs/Policy/<sdk_dir>/<topic>.md per the trustabl-rules
+    template (`docs/policy-rationale-doc-template-guide.md`).
 
-    Creates the topic file if absent. In dry-run mode prints the path +
-    resulting YAML and does not write.
+    `rationale_md` is the agent-authored body (everything BELOW the
+    metadata block: "What this policy covers", threat model,
+    "Rule-by-rule defense" with the rule_id as its own H3, "What this
+    policy does not cover", "Recommendations beyond the fix"). The tool
+    composes the metadata block (Policy ID / File / Rules / Severities /
+    Fix types / References) from draft fields + `owasp_refs` and prepends
+    it. If the rationale doc already exists, the new rule's H3 block is
+    appended under "Rule-by-rule defense" instead of overwriting.
+
+    `owasp_refs` is a list of OWASP LLM Top 10:2025 IDs (e.g. ["LLM01",
+    "LLM06"]) that anchor the rule in an external standard. Required by
+    the template's metadata block.
+
+    `fix_type` ∈ {"config", "code"} per the template — config fixes are
+    prioritized in scan output because they carry lower breakage risk.
+
+    Creates the YAML topic file if absent. In dry-run mode prints both
+    files and does not write.
     """
     required = {
         "id", "title", "severity", "confidence", "applies_to",
@@ -131,13 +158,89 @@ def write_rule_yaml(state: MiningState, draft: dict, topic: str) -> str:
 
     rendered = yaml.safe_dump(doc, sort_keys=False, indent=2)
 
+    rationale_body = (rationale_md or "").strip()
+    refs = [r for r in (owasp_refs or []) if isinstance(r, str) and r.strip()]
+    if fix_type not in ("config", "code"):
+        return f"REJECTED: fix_type must be 'config' or 'code', got {fix_type!r}"
+
+    sdk_dir_name = patterns.SDK_DIRS[sdk]
+    rationale_path = (
+        state.repo_root / "docs" / "Policy" / sdk_dir_name / f"{topic}.md"
+    )
+
+    warnings: list[str] = []
+    if not rationale_body:
+        warnings.append("no rationale_md")
+    if not refs:
+        warnings.append("no owasp_refs")
+    warn_suffix = f" [WARN: {', '.join(warnings)}]" if warnings else ""
+
     if state.dry_run:
-        print(f"\n=== DRY-RUN WRITE: {path} ===")
+        print(f"\n=== DRY-RUN WRITE YAML: {path} ===")
         print(rendered)
+        print(f"\n=== DRY-RUN WRITE RATIONALE: {rationale_path} ===")
+        print(_compose_rationale_doc(
+            yaml_relpath=f"{sdk_dir_name}/{topic}.yaml",
+            rules=[(draft["id"], draft["severity"], fix_type)],
+            owasp_refs=refs,
+            body_md=rationale_body or "<rationale missing>",
+            existing_text=None,
+        ))
         state.written_rules.append((draft["id"], str(path)))
-        return f"DRY_RUN: would have written {draft['id']} -> {path}"
+        return f"DRY_RUN: would have written {draft['id']} -> {path}{warn_suffix}"
 
     sdk_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
+
+    rationale_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = rationale_path.read_text(encoding="utf-8") if rationale_path.exists() else None
+    composed = _compose_rationale_doc(
+        yaml_relpath=f"{sdk_dir_name}/{topic}.yaml",
+        rules=[(draft["id"], draft["severity"], fix_type)],
+        owasp_refs=refs,
+        body_md=rationale_body,
+        existing_text=existing,
+    )
+    rationale_path.write_text(composed, encoding="utf-8")
+
     state.written_rules.append((draft["id"], str(path)))
-    return f"WROTE: {draft['id']} -> {path}"
+    return (
+        f"WROTE: {draft['id']} -> {path} + rationale {rationale_path}{warn_suffix}"
+    )
+
+
+def _compose_rationale_doc(
+    yaml_relpath: str,
+    rules: list[tuple[str, str, str]],  # (rule_id, severity, fix_type)
+    owasp_refs: list[str],
+    body_md: str,
+    existing_text: str | None,
+) -> str:
+    """Build (or extend) a policy rationale doc per the template guide."""
+    if existing_text:
+        # Topic doc exists — append this rule's H3 block under the existing
+        # "Rule-by-rule defense" section instead of rewriting metadata.
+        # The body_md from the agent should already start at the rule's H3.
+        if not body_md.endswith("\n"):
+            body_md += "\n"
+        if not existing_text.endswith("\n"):
+            existing_text += "\n"
+        return existing_text + "\n" + body_md
+
+    rule_ids = ", ".join(r[0] for r in rules)
+    severities = ", ".join(r[1] for r in rules)
+    fix_types = ", ".join(r[2] for r in rules)
+    refs_str = ", ".join(owasp_refs) if owasp_refs else "(none — fill before merging)"
+    metadata = (
+        f"# Policy Rationale: {yaml_relpath.split('/')[-1].replace('.yaml','').replace('_',' ').title()}\n"
+        f"\n"
+        f"**Policy ID:** `{rules[0][0].split('-')[0]}-policy`  \n"
+        f"**File:** `{yaml_relpath}`  \n"
+        f"**Rules:** {rule_ids}  \n"
+        f"**Severities:** {severities}  \n"
+        f"**Fix types:** {fix_types}  \n"
+        f"**References:** {refs_str}\n"
+        f"\n"
+        f"---\n\n"
+    )
+    return metadata + body_md.lstrip() + ("\n" if not body_md.endswith("\n") else "")
