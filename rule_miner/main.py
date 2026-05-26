@@ -11,7 +11,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from . import agent, patterns, scanner
+from . import agent, discover, patterns, scanner, trustabl_scanner
 from .tools import CandidatePattern, MiningState
 
 CACHE_ROOT = Path.home() / ".cache" / "trustabl-rule-miner"
@@ -56,13 +56,70 @@ def cli() -> int:
         action="store_true",
         help="Print the YAML each rule would land in, do not write files.",
     )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Before scanning, query Sourcegraph for public repos that import "
+        "each SDK and merge them into the target list for this run.",
+    )
+    parser.add_argument(
+        "--discover-limit",
+        type=int,
+        default=100,
+        help="Per-SDK cap on repos discovered (default: 100).",
+    )
+    parser.add_argument(
+        "--discover-write",
+        action="store_true",
+        help="With --discover, also persist the merged target list back to "
+        "--targets PATH (default: in-memory for this run only).",
+    )
+    parser.add_argument(
+        "--use-trustabl",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Use the trustabl Go binary as an additional scanner for tools, "
+        "agents, and subagents. 'auto' (default) uses it when found on PATH. "
+        "Requires a separate `go build` of github.com/trustabl/trustabl.",
+    )
     args = parser.parse_args()
+
+    trustabl_enabled = (
+        args.use_trustabl == "on"
+        or (args.use_trustabl == "auto" and trustabl_scanner.available())
+    )
+    if args.use_trustabl == "on" and not trustabl_scanner.available():
+        print("error: --use-trustabl on but `trustabl` binary not on PATH",
+              file=sys.stderr)
+        return 2
 
     rules_repo_path = _resolve_rules_repo(args.rules_repo)
     if rules_repo_path is None:
         return 2
 
     targets = json.loads(args.targets.read_text(encoding="utf-8"))
+
+    if args.discover:
+        sdks_to_discover = (
+            [args.only_sdk] if args.only_sdk else list(discover.SDK_QUERY)
+        )
+        discovered: list[discover.DiscoveredTarget] = []
+        for sdk in sdks_to_discover:
+            try:
+                hits = discover.discover(sdk, limit=args.discover_limit)
+            except Exception as exc:  # noqa: BLE001 -- network/parse errors
+                print(f"discover({sdk}): {exc}", file=sys.stderr)
+                continue
+            print(f"  discover({sdk}): {len(hits)} repos", file=sys.stderr)
+            discovered.extend(hits)
+        targets, added = discover.merge_into_targets(targets, discovered)
+        print(f"  added {added} new targets", file=sys.stderr)
+        if args.discover_write and added:
+            args.targets.write_text(
+                json.dumps(targets, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"  wrote merged targets -> {args.targets}", file=sys.stderr)
+
     if args.only_sdk:
         targets = [t for t in targets if t["sdk"] == args.only_sdk]
     if not targets:
@@ -71,6 +128,8 @@ def cli() -> int:
 
     # Step 1-3: clone + scan
     all_records = []
+    all_agents: list = []
+    all_subagents: list = []
     for tgt in targets:
         try:
             clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
@@ -80,6 +139,23 @@ def cli() -> int:
             continue
         roots = [clone_path / p for p in tgt["paths"]]
         records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
+        if trustabl_enabled:
+            try:
+                tr = trustabl_scanner.scan(tgt["repo"], clone_path)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {tgt['repo']}: trustabl scan failed -- {exc}",
+                      file=sys.stderr)
+            else:
+                merged = trustabl_scanner.merge_tools(records, tr.tools)
+                added = len(merged) - len(records)
+                records = merged
+                all_agents.extend(tr.agents)
+                all_subagents.extend(tr.subagents)
+                print(
+                    f"  {tgt['repo']}: trustabl +{added} tools, "
+                    f"{len(tr.agents)} agents, {len(tr.subagents)} subagents",
+                    file=sys.stderr,
+                )
         print(f"  {tgt['repo']}: {len(records)} tools", file=sys.stderr)
         all_records.extend(records)
 

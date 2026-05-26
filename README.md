@@ -55,6 +55,18 @@ Options:
 - `--only-sdk {openai_agents,claude_agent_sdk,google_adk}` — restrict.
 - `--min-occurrences N` — minimum recurrence to flag (default 3).
 - `--dry-run` — print the YAML each rule would land in, do not write.
+- `--discover` — before scanning, query Sourcegraph's public stream API
+  for repos that import each SDK and merge them into the target list for
+  this run. Cross-forge (GitHub / GitLab / Bitbucket) — currently every
+  hit is github.com because the three SDKs have ~0 adoption elsewhere.
+- `--discover-limit N` — per-SDK cap on discovered repos (default 100).
+- `--discover-write` — with `--discover`, also persist the merged target
+  list back into `--targets` PATH.
+- `--use-trustabl {auto,on,off}` — use the
+  [trustabl](https://github.com/trustabl/trustabl) Go binary as an
+  additional scanner. Adds Python + TypeScript inventory of tools, agents,
+  subagents, MCP servers, hosted tools. Default `auto`: enabled when the
+  binary is on PATH. Build trustabl with `CGO_ENABLED=1 go build -o trustabl ./cmd/trustabl`.
 
 ### First run (recommended)
 
@@ -113,11 +125,13 @@ rule-miner/
 ├── targets.json
 ├── rule_miner/
 │   ├── __init__.py
-│   ├── main.py        CLI entrypoint
-│   ├── scanner.py     AST tool discovery
-│   ├── patterns.py    feature → covered-by-rule mapping
-│   ├── agent.py       Claude Agent SDK orchestration
-│   └── tools.py       framework-agnostic tool callables
+│   ├── main.py               CLI entrypoint
+│   ├── scanner.py            stdlib AST tool discovery
+│   ├── trustabl_scanner.py   optional adapter for the trustabl binary
+│   ├── discover.py           Sourcegraph stream API -> targets
+│   ├── patterns.py           feature → covered-by-rule mapping
+│   ├── agent.py              Claude Agent SDK orchestration
+│   └── tools.py              framework-agnostic tool callables
 └── tests/
     ├── fixtures/
     └── test_scanner.py
