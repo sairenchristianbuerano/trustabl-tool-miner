@@ -72,7 +72,12 @@ def cli() -> int:
     # Step 1-3: clone + scan
     all_records = []
     for tgt in targets:
-        clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
+        try:
+            clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
+        except subprocess.CalledProcessError as exc:
+            print(f"  {tgt['repo']}: clone failed ({exc.returncode}) -- skipped",
+                  file=sys.stderr)
+            continue
         roots = [clone_path / p for p in tgt["paths"]]
         records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
         print(f"  {tgt['repo']}: {len(records)} tools", file=sys.stderr)

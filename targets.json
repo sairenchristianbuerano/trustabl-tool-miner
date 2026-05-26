@@ -16,5 +16,53 @@
     "sdk": "google_adk",
     "paths": ["contributing/samples"],
     "ref": "main"
+  },
+  {
+    "repo": "NVIDIA/GenerativeAIExamples",
+    "sdk": "openai_agents",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "mikeperry-tor/HostileShop",
+    "sdk": "openai_agents",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "Azure/azure-functions-durable-python",
+    "sdk": "openai_agents",
+    "paths": ["samples"],
+    "ref": "main"
+  },
+  {
+    "repo": "anthropics/agent-sdk-workshop",
+    "sdk": "claude_agent_sdk",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "prowler-cloud/prowler-studio",
+    "sdk": "claude_agent_sdk",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "google/adk-samples",
+    "sdk": "google_adk",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "GoogleCloudPlatform/agent-starter-pack",
+    "sdk": "google_adk",
+    "paths": ["."],
+    "ref": "main"
+  },
+  {
+    "repo": "SolaceLabs/solace-agent-mesh",
+    "sdk": "google_adk",
+    "paths": ["."],
+    "ref": "main"
   }
 ]
