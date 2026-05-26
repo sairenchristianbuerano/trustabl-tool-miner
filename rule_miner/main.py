@@ -8,10 +8,19 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
-from . import agent, discover, patterns, scanner, trustabl_scanner
+from . import (
+    agent,
+    discover,
+    heartbeat,
+    patterns,
+    scanned_log,
+    scanner,
+    trustabl_scanner,
+)
 from .tools import CandidatePattern, MiningState
 
 CACHE_ROOT = Path.home() / ".cache" / "trustabl-rule-miner"
@@ -82,6 +91,40 @@ def cli() -> int:
         "agents, and subagents. 'auto' (default) uses it when found on PATH. "
         "Requires a separate `go build` of github.com/trustabl/trustabl.",
     )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between progress heartbeat lines on stderr (default 60). "
+        "Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=3,
+        help="Cap on number of target repos scanned per run (default 3). "
+        "Applied after --discover merge. Set to 0 for no cap. Keeps disk "
+        "usage bounded.",
+    )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        default=300,
+        help="Stop the scan loop once total wall clock exceeds this many "
+        "seconds (default 300 = 5 min). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-skip-scanned",
+        action="store_true",
+        help="Don't skip repos already recorded in the scanned-log. By "
+        "default the miner skips any (repo@ref) it has scanned before.",
+    )
+    parser.add_argument(
+        "--reset-scanned-log",
+        action="store_true",
+        help="Wipe the scanned-log before this run so every target is fair "
+        "game again.",
+    )
     args = parser.parse_args()
 
     trustabl_enabled = (
@@ -122,42 +165,115 @@ def cli() -> int:
 
     if args.only_sdk:
         targets = [t for t in targets if t["sdk"] == args.only_sdk]
+
+    if args.reset_scanned_log:
+        scanned_log.reset()
+        print("  wiped scanned-log", file=sys.stderr)
+    scanned_keys = (
+        set() if args.no_skip_scanned else scanned_log.load()
+    )
+    if scanned_keys:
+        before = len(targets)
+        targets = [
+            t for t in targets
+            if not scanned_log.already_scanned(
+                t["repo"], t.get("ref", "main"), scanned_keys
+            )
+        ]
+        skipped = before - len(targets)
+        if skipped:
+            print(
+                f"  skipping {skipped} previously-scanned repos "
+                f"(--no-skip-scanned to override)",
+                file=sys.stderr,
+            )
+
+    if args.max_targets > 0 and len(targets) > args.max_targets:
+        print(
+            f"  capping targets {len(targets)} -> {args.max_targets} "
+            f"(--max-targets)",
+            file=sys.stderr,
+        )
+        targets = targets[: args.max_targets]
     if not targets:
         print("no targets to scan", file=sys.stderr)
         return 1
 
     # Step 1-3: clone + scan
+    hb: heartbeat.Heartbeat | None = None
+    if args.heartbeat_interval > 0:
+        hb = heartbeat.Heartbeat(interval=args.heartbeat_interval)
+        hb.start(targets_total=len(targets))
+
     all_records = []
     all_agents: list = []
     all_subagents: list = []
-    for tgt in targets:
-        try:
-            clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
-        except subprocess.CalledProcessError as exc:
-            print(f"  {tgt['repo']}: clone failed ({exc.returncode}) -- skipped",
-                  file=sys.stderr)
-            continue
-        roots = [clone_path / p for p in tgt["paths"]]
-        records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
-        if trustabl_enabled:
-            try:
-                tr = trustabl_scanner.scan(tgt["repo"], clone_path)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  {tgt['repo']}: trustabl scan failed -- {exc}",
-                      file=sys.stderr)
-            else:
-                merged = trustabl_scanner.merge_tools(records, tr.tools)
-                added = len(merged) - len(records)
-                records = merged
-                all_agents.extend(tr.agents)
-                all_subagents.extend(tr.subagents)
+    deadline = (
+        time.monotonic() + args.max_runtime_seconds
+        if args.max_runtime_seconds > 0
+        else None
+    )
+    try:
+        for tgt in targets:
+            if deadline is not None and time.monotonic() > deadline:
                 print(
-                    f"  {tgt['repo']}: trustabl +{added} tools, "
-                    f"{len(tr.agents)} agents, {len(tr.subagents)} subagents",
+                    f"  deadline hit ({args.max_runtime_seconds}s) -- "
+                    f"stopping scan loop early",
                     file=sys.stderr,
                 )
-        print(f"  {tgt['repo']}: {len(records)} tools", file=sys.stderr)
-        all_records.extend(records)
+                break
+            if hb:
+                hb.set_target(tgt["repo"])
+            try:
+                clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
+            except subprocess.CalledProcessError as exc:
+                print(f"  {tgt['repo']}: clone failed ({exc.returncode}) -- skipped",
+                      file=sys.stderr)
+                if hb:
+                    hb.target_done()
+                continue
+            roots = [clone_path / p for p in tgt["paths"]]
+            records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
+            tr_agents: list = []
+            tr_subagents: list = []
+            if trustabl_enabled:
+                try:
+                    tr = trustabl_scanner.scan(tgt["repo"], clone_path)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  {tgt['repo']}: trustabl scan failed -- {exc}",
+                          file=sys.stderr)
+                else:
+                    merged = trustabl_scanner.merge_tools(records, tr.tools)
+                    added = len(merged) - len(records)
+                    records = merged
+                    tr_agents = tr.agents
+                    tr_subagents = tr.subagents
+                    all_agents.extend(tr_agents)
+                    all_subagents.extend(tr_subagents)
+                    print(
+                        f"  {tgt['repo']}: trustabl +{added} tools, "
+                        f"{len(tr_agents)} agents, {len(tr_subagents)} subagents",
+                        file=sys.stderr,
+                    )
+            print(f"  {tgt['repo']}: {len(records)} tools", file=sys.stderr)
+            all_records.extend(records)
+            scanned_log.record(
+                repo=tgt["repo"],
+                ref=tgt.get("ref", "main"),
+                tools=len(records),
+                agents=len(tr_agents),
+                subagents=len(tr_subagents),
+            )
+            if hb:
+                hb.add_counts(
+                    tools=len(records),
+                    agents=len(tr_agents),
+                    subagents=len(tr_subagents),
+                )
+                hb.target_done()
+    finally:
+        if hb:
+            hb.stop()
 
     # Step 4-5: feature-match + aggregate
     candidates = _aggregate_candidates(all_records, args.min_occurrences)

@@ -67,6 +67,19 @@ Options:
   additional scanner. Adds Python + TypeScript inventory of tools, agents,
   subagents, MCP servers, hosted tools. Default `auto`: enabled when the
   binary is on PATH. Build trustabl with `CGO_ENABLED=1 go build -o trustabl ./cmd/trustabl`.
+- `--max-targets N` — cap on target repos scanned per run (default **3**).
+  Applied after `--discover` merge. Keeps disk usage bounded. Set to 0
+  for no cap.
+- `--max-runtime-seconds N` — stop the scan loop early once total wall
+  clock exceeds N seconds (default **300** = 5 min). 0 disables.
+- `--heartbeat-interval N` — seconds between stderr heartbeat lines
+  (default 60). Lines show elapsed time, current target, and cumulative
+  tool / agent / subagent counts. Set to 0 to silence.
+- `--no-skip-scanned` — by default the miner skips any `(repo@ref)` it
+  has scanned before. Log lives at
+  `~/.cache/trustabl-rule-miner/scanned.json` (one JSONL entry per
+  successful target). Pass this flag to re-scan everything.
+- `--reset-scanned-log` — wipe the log before running.
 
 ### First run (recommended)
 
