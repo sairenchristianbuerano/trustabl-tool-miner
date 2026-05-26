@@ -305,7 +305,11 @@ def cli() -> int:
             hb.stop()
 
     # Step 4-5: feature-match + aggregate
-    candidates = _aggregate_candidates(all_records, args.min_occurrences)
+    covered = patterns.derive_covered_features(rules_repo_path)
+    for sdk, feats in sorted(covered.items()):
+        if feats:
+            print(f"  covered({sdk}): {sorted(feats)}", file=sys.stderr)
+    candidates = _aggregate_candidates(all_records, args.min_occurrences, covered)
     if not candidates:
         print("no uncovered patterns crossed the threshold; nothing to draft.",
               file=sys.stderr)
@@ -426,11 +430,13 @@ def _ensure_clone(repo: str, ref: str) -> Path:
 
 
 def _aggregate_candidates(
-    records: list[scanner.ToolRecord], min_occurrences: int,
+    records: list[scanner.ToolRecord],
+    min_occurrences: int,
+    covered: dict[str, set[str]] | None = None,
 ) -> list[CandidatePattern]:
     buckets: dict[tuple[str, str], list[scanner.ToolRecord]] = defaultdict(list)
     for rec in records:
-        for feature in patterns.uncovered_features(rec):
+        for feature in patterns.uncovered_features(rec, covered):
             buckets[(rec.sdk, feature)].append(rec)
 
     out: list[CandidatePattern] = []

@@ -83,29 +83,43 @@ FEATURE_CHECKS: dict[str, Callable[[ToolRecord], bool]] = {
     ),
 }
 
-# Map: feature name -> shipped rule id that catches it (None = uncovered).
-COVERED_BY_RULE: dict[str, dict[str, str]] = {
-    "openai_agents": {
-        "missing_docstring": "OAI-001",
-        "missing_typed_params": "OAI-002",
-        "ambiguous_name": "OAI-007",
-        "mutating_prefix_no_idempotency_kwarg": "OAI-009",
-        "network_call": "OAI-005",
-    },
-    "claude_agent_sdk": {
-        "missing_docstring": "CSDK-001",
-        "missing_typed_params": "CSDK-002",
-        "ambiguous_name": "CSDK-007",
-        "mutating_prefix_no_idempotency_kwarg": "CSDK-006",
-        "network_call": "CSDK-003",
-    },
-    "google_adk": {
-        "missing_docstring": "ADK-001",
-        "missing_typed_params": "ADK-002",
-        "ambiguous_name": "ADK-007",
-        "mutating_prefix_no_idempotency_kwarg": "ADK-006",
-        "network_call": "ADK-003",
-    },
+# Body-text fragments that, when present in a rule's match.has_body_text,
+# indicate the rule already covers that feature. Compared against shipped
+# YAMLs at runtime in derive_covered_features() — replaces the old
+# hardcoded COVERED_BY_RULE map which went stale every time a new rule
+# shipped.
+BODY_TEXT_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "calls_subprocess": ("subprocess.",),
+    "calls_shell_true": ("os.system", "os.popen", "shell=True"),
+    "uses_pickle": ("pickle.",),
+    "writes_env_var": ("os.environ[", "os.putenv"),
+    "prints_to_stdout": ("print(",),
+    "uses_eval_or_exec": ("eval(", "exec("),
+    "bare_except": ("except:",),
+    "network_call": (
+        "requests.", "httpx.", "urllib.request.urlopen", "aiohttp.",
+    ),
+}
+
+# Match-key signatures: rule fields that signal coverage directly.
+MATCH_KEY_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "missing_docstring": ("requires_docstring", "missing_docstring",
+                          "has_docstring"),
+    "missing_typed_params": ("requires_typed_params", "untyped_params",
+                             "has_typed_params"),
+    "ambiguous_name": ("ambiguous_name", "name_in_list", "tool_name_matches"),
+    "mutating_prefix_no_idempotency_kwarg": (
+        "missing_idempotency", "mutating_prefix_no_idempotency",
+        "requires_idempotency",
+    ),
+    "has_var_kwargs": ("accepts_var_kwargs", "has_kwargs", "has_var_kwargs"),
+    "mutable_default_arg": ("has_mutable_default", "mutable_default"),
+}
+
+SDK_TO_APPLIES_TO = {
+    "openai_agents": "openai_tool",
+    "claude_agent_sdk": "claude_sdk_tool",
+    "google_adk": "adk_function_tool",
 }
 
 
@@ -113,9 +127,66 @@ def features_present(tool: ToolRecord) -> set[str]:
     return {name for name, check in FEATURE_CHECKS.items() if check(tool)}
 
 
-def uncovered_features(tool: ToolRecord) -> set[str]:
-    covered = set(COVERED_BY_RULE.get(tool.sdk, {}).keys())
-    return features_present(tool) - covered
+def uncovered_features(
+    tool: ToolRecord,
+    covered: dict[str, set[str]] | None = None,
+) -> set[str]:
+    """Features present on `tool` that no shipped rule catches.
+
+    `covered` is the precomputed result of `derive_covered_features()`
+    keyed by SDK. If None, treats every feature as uncovered (the caller
+    should always pass derived coverage in real use).
+    """
+    sdk_covered = (covered or {}).get(tool.sdk, set())
+    return features_present(tool) - sdk_covered
+
+
+def derive_covered_features(repo_root: Path) -> dict[str, set[str]]:
+    """Walk shipped YAMLs and infer which features are already covered.
+
+    Returns {sdk_name: {feature_name, ...}}. Match logic:
+      - rule.match.has_body_text fragments → BODY_TEXT_SIGNATURES lookup
+      - rule.match keys → MATCH_KEY_SIGNATURES lookup
+      - rule.applies_to entries → SDK assignment
+
+    Replaces the old hardcoded COVERED_BY_RULE map. New rules ship → next
+    scan auto-skips the matching feature; no patterns.py edit required.
+    """
+    covered: dict[str, set[str]] = {sdk: set() for sdk in SDK_DIRS}
+    for sdk, sdk_dir in SDK_DIRS.items():
+        sdk_path = repo_root / sdk_dir
+        if not sdk_path.exists():
+            continue
+        for yml in sdk_path.glob("*.yaml"):
+            try:
+                doc = yaml.safe_load(yml.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError:
+                continue
+            for rule in doc.get("rules", []) or []:
+                if not isinstance(rule, dict):
+                    continue
+                applies = rule.get("applies_to") or []
+                tool_token = SDK_TO_APPLIES_TO.get(sdk)
+                if tool_token and tool_token not in applies:
+                    continue
+                match = rule.get("match") or {}
+                if not isinstance(match, dict):
+                    continue
+                _attribute_coverage(covered[sdk], match)
+    return covered
+
+
+def _attribute_coverage(bucket: set[str], match: dict) -> None:
+    body_texts = match.get("has_body_text") or []
+    if isinstance(body_texts, list):
+        body_blob = " ".join(str(t) for t in body_texts)
+        for feature, fragments in BODY_TEXT_SIGNATURES.items():
+            if any(frag in body_blob for frag in fragments):
+                bucket.add(feature)
+    match_keys = set(match.keys())
+    for feature, key_options in MATCH_KEY_SIGNATURES.items():
+        if match_keys & set(key_options):
+            bucket.add(feature)
 
 
 def load_existing_rule_ids(repo_root: Path) -> set[str]:
