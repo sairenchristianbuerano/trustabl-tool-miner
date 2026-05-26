@@ -1,0 +1,20 @@
+[
+  {
+    "repo": "openai/openai-agents-python",
+    "sdk": "openai_agents",
+    "paths": ["examples"],
+    "ref": "main"
+  },
+  {
+    "repo": "anthropics/claude-agent-sdk-python",
+    "sdk": "claude_agent_sdk",
+    "paths": ["examples"],
+    "ref": "main"
+  },
+  {
+    "repo": "google/adk-python",
+    "sdk": "google_adk",
+    "paths": ["contributing/samples"],
+    "ref": "main"
+  }
+]
