@@ -135,13 +135,20 @@ def write_rule_yaml(
     if draft["id"] in existing:
         return f"REJECTED: id {draft['id']} already exists in the rule pack"
 
+    scope = draft.get("scope", "tool")
+    if scope not in {"tool", "agent", "subagent", "repo"}:
+        return f"REJECTED: scope must be tool|agent|subagent|repo, got {scope!r}"
+
     if not topic or "/" in topic or "\\" in topic or topic.endswith(".yaml"):
         return "REJECTED: topic must be a bare filename stem (no slashes, no .yaml)"
 
     sdk_dir = state.repo_root / patterns.SDK_DIRS[sdk]
     path = sdk_dir / f"{topic}.yaml"
 
-    persisted = {k: v for k, v in draft.items() if k != "sdk"}
+    # Canonical key order matches shipped rules like
+    # openai_sdk/observability.yaml (OAI-010). Stable order = stable diffs
+    # and the engine's YAML schema reads identical files either way.
+    persisted = _canonicalize_rule(draft, scope)
 
     if path.exists():
         try:
@@ -207,6 +214,26 @@ def write_rule_yaml(
     return (
         f"WROTE: {draft['id']} -> {path} + rationale {rationale_path}{warn_suffix}"
     )
+
+
+def _canonicalize_rule(draft: dict, scope: str) -> dict:
+    """Reorder + default-fill fields to match the canonical shipped shape
+    (id, title, scope, severity, confidence, language, applies_to, match,
+    explanation, fix). Strips `sdk` (miner-internal). Defaults `language`
+    to `python` per CLAUDE.md.
+    """
+    out: dict = {}
+    out["id"] = draft["id"]
+    out["title"] = draft["title"]
+    out["scope"] = scope
+    out["severity"] = draft["severity"]
+    out["confidence"] = float(draft["confidence"])
+    out["language"] = draft.get("language", "python")
+    out["applies_to"] = list(draft["applies_to"])
+    out["match"] = draft["match"]
+    out["explanation"] = draft["explanation"]
+    out["fix"] = draft["fix"]
+    return out
 
 
 def _compose_rationale_doc(
