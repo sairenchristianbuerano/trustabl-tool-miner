@@ -193,6 +193,9 @@ def cli() -> int:
     scanned_keys = (
         set() if args.no_skip_scanned else scanned_log.load()
     )
+
+    if not args.keep_clones:
+        _sweep_orphan_clones(scanned_keys)
     if scanned_keys:
         before = len(targets)
         targets = [
@@ -342,6 +345,29 @@ def _resolve_rules_repo(explicit: Path | None) -> Path | None:
         file=sys.stderr,
     )
     return None
+
+
+def _sweep_orphan_clones(scanned_keys: set[str]) -> None:
+    """Delete any cache subdir whose `owner__repo` matches a scanned-log entry.
+
+    Catches clones left over from older runs (pre-cleanup-feature) or from
+    runs that crashed before per-target rmtree fired. Skips dirs whose
+    repo isn't in scanned-log so an in-progress clone isn't blown away.
+    """
+    if not CACHE_ROOT.exists():
+        return
+    scanned_repos = {k.split("@", 1)[0] for k in scanned_keys}
+    swept = 0
+    for entry in CACHE_ROOT.iterdir():
+        if not entry.is_dir():
+            continue
+        repo = entry.name.replace("__", "/", 1)
+        if repo in scanned_repos:
+            shutil.rmtree(entry, ignore_errors=True)
+            swept += 1
+    if swept:
+        print(f"  swept {swept} orphan clones from {CACHE_ROOT}",
+              file=sys.stderr)
 
 
 def _ensure_clone(repo: str, ref: str) -> Path:
