@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -126,6 +127,13 @@ def cli() -> int:
         action="store_true",
         help="Wipe the scanned-log before this run so every target is fair "
         "game again.",
+    )
+    parser.add_argument(
+        "--keep-clones",
+        action="store_true",
+        help="Keep cached clones in ~/.cache/trustabl-rule-miner after each "
+        "scan. By default the clone dir is deleted once the target's tools "
+        "are recorded to the scanned-log -- frees disk between runs.",
     )
     args = parser.parse_args()
 
@@ -277,6 +285,10 @@ def cli() -> int:
                 agents=len(tr_agents),
                 subagents=len(tr_subagents),
             )
+            if not args.keep_clones:
+                shutil.rmtree(clone_path, ignore_errors=True)
+                print(f"  {tgt['repo']}: cleaned clone {clone_path}",
+                      file=sys.stderr)
             if hb:
                 hb.add_counts(
                     tools=len(records),

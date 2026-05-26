@@ -74,6 +74,13 @@ FEATURE_CHECKS: dict[str, Callable[[ToolRecord], bool]] = {
     "writes_env_var": lambda t: any(
         c in ("os.environ.__setitem__", "os.putenv") for c in t.body_call_targets
     ),
+    "bare_except": lambda t: t.has_bare_except,
+    "mutable_default_arg": lambda t: t.has_mutable_default,
+    "accepts_var_kwargs": lambda t: t.has_var_kwargs,
+    "prints_to_stdout": lambda t: "print" in t.body_call_targets,
+    "uses_eval_or_exec": lambda t: any(
+        c in ("eval", "exec", "compile") for c in t.body_call_targets
+    ),
 }
 
 # Map: feature name -> shipped rule id that catches it (None = uncovered).

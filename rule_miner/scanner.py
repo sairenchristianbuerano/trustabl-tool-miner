@@ -27,6 +27,9 @@ class ToolRecord:
     typed_params: bool
     decorator_kwargs: dict[str, str]
     body_call_targets: tuple[str, ...]
+    has_bare_except: bool = False
+    has_mutable_default: bool = False
+    has_var_kwargs: bool = False
 
 
 def scan_paths(repo: str, sdk: str, roots: Iterable[Path]) -> list[ToolRecord]:
@@ -93,6 +96,9 @@ def _from_decorated_func(
         typed_params=_all_params_typed(fn.args),
         decorator_kwargs=deco_kwargs,
         body_call_targets=tuple(_body_calls(fn)),
+        has_bare_except=_has_bare_except(fn),
+        has_mutable_default=_has_mutable_default(fn.args),
+        has_var_kwargs=fn.args.vararg is not None or fn.args.kwarg is not None,
     )
 
 
@@ -126,7 +132,30 @@ def _from_function_tool_call(
         typed_params=_all_params_typed(fn.args),
         decorator_kwargs=deco_kwargs,
         body_call_targets=tuple(_body_calls(fn)),
+        has_bare_except=_has_bare_except(fn),
+        has_mutable_default=_has_mutable_default(fn.args),
+        has_var_kwargs=fn.args.vararg is not None or fn.args.kwarg is not None,
     )
+
+
+def _has_bare_except(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for node in ast.walk(fn):
+        if isinstance(node, ast.ExceptHandler) and node.type is None:
+            return True
+    return False
+
+
+def _has_mutable_default(args: ast.arguments) -> bool:
+    for default in list(args.defaults) + list(args.kw_defaults):
+        if default is None:
+            continue
+        if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+            return True
+        if isinstance(default, ast.Call):
+            name = _dotted_call_name(default.func)
+            if name in ("list", "dict", "set"):
+                return True
+    return False
 
 
 def _decorator_name(d: ast.expr) -> str | None:
