@@ -6,5 +6,5 @@ dist/
 .venv/
 .env
 .pytest_cache/
-.mypy_cache/
+.mypy_cache
 .ruff_cache/

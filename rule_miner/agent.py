@@ -25,7 +25,14 @@ from claude_agent_sdk import (  # type: ignore[import-not-found]
 )
 
 from . import tools as miner_tools
-from .tools import MiningState, SDK_TO_TOOL_TOKEN
+from .tools import (
+    MiningState,
+    SDK_TO_AGENT_TOKENS,
+    SDK_TO_REPO_TOKEN,
+    SDK_TO_SKILL_TOKEN,
+    SDK_TO_TOOL_TOKEN,
+    SUBAGENT_TOKEN,
+)
 
 _STATE: MiningState | None = None
 
@@ -75,8 +82,17 @@ async def _t_read_callsite(args: dict) -> dict:
     "call_without_kwarg, param_name_matches, all/any/not, etc.), "
     "explanation (multi-paragraph naming the consequence), fix "
     "(concrete remediation). Plus miner-internal `sdk` (openai_agents | "
-    "claude_agent_sdk | google_adk). Optional: scope (tool|agent|repo|"
-    "subagent, default `tool`), language (default `python`). "
+    "claude_agent_sdk | google_adk). Optional: scope (tool|agent|subagent|"
+    "repo|skill, default `tool`), language (default `python`; omitted "
+    "automatically for subagent/skill). IMPORTANT: applies_to must fit the "
+    "scope, not always the tool token — agent: openai_agent / "
+    "openai_sandbox_agent / claude_agent_definition / adk_llm_agent / "
+    "adk_sequential_agent / adk_parallel_agent / adk_loop_agent / "
+    "adk_langgraph_agent; subagent: claude_subagent; repo: openai_agents / "
+    "claude_sdk / google_adk; skill: skill (provisional). Use match "
+    "predicates valid for the scope (agent_grants_builtin_tool, "
+    "agent_kwarg_list_empty, subagent_grants_tool, repo_component_present, "
+    "repo_has_sdk_in_code, etc.). "
     "`policy_meta`: REQUIRED when topic file doesn't exist yet — dict "
     "with id (lowercase_underscored, e.g. `openai_sdk_shell_safety`), "
     "name (human title), category (must match sdk: openai_sdk / "
@@ -138,38 +154,67 @@ def _system_prompt(repo_root: Path) -> str:
         miner_root / "schema.yaml",
         "<schema.yaml missing from rule-miner root>",
     )
+    agent_tokens = {sdk: sorted(v) for sdk, v in SDK_TO_AGENT_TOKENS.items()}
     return f"""You are a rule-mining assistant for the Trustabl detection-rule
 pack. Your task: for each candidate pattern surfaced by
 list_candidate_patterns, write ONE rule directly into the local rules
 pack at {repo_root}.
 
+Each candidate carries a `scope` ("tool", "agent", "subagent", "repo", or
+"skill") and a `feature`. The scope decides which `applies_to` tokens,
+`match` predicates, ID range, and topic file are valid. Honor it exactly —
+the writer REJECTS a draft whose applies_to doesn't fit its scope.
+
 For each candidate:
-  1. Call read_callsite on 2-3 example callsites to confirm the pattern.
-  2. Pick the `topic` filename to write into. Prefer an existing topic
-     file under {repo_root}/<sdk_dir>/ when one fits (e.g. network.yaml,
-     idempotency.yaml, path_safety.yaml, error_handling.yaml,
-     tool_definition.yaml, agent_safety.yaml). If no existing topic is
-     a clean fit, create a new topic file with a short descriptive name
-     (e.g. shell_safety, deserialization, env_safety).
+  1. Confirm the pattern. For tool/agent candidates the examples have real
+     file+line — call read_callsite on 2-3 of them. For subagent/skill the
+     example file is a .md (read_callsite still works). For repo candidates
+     there is no callsite (the "file" is the repo name); rely on the
+     feature meaning + the authoring contract.
+  2. Pick the `topic` filename under {repo_root}/<sdk_dir>/. Prefer an
+     existing topic that fits the scope+feature:
+       - tool   -> network.yaml, idempotency.yaml, path_safety.yaml,
+                   error_handling.yaml, tool_definition.yaml, shell_safety.yaml
+       - agent  -> agent_safety.yaml, builtin_tools.yaml
+       - subagent -> subagent_safety.yaml
+       - repo   -> a repo-level topic (e.g. repo_hygiene.yaml,
+                   project_safety.yaml) — create if none fits
+       - skill  -> skill_safety.yaml (provisional; see note below)
+     Only create a new topic file (with policy_meta) when none is a clean fit.
   3. Build the draft:
-       - `id`: matching SDK ID prefix (CSDK- / OAI- / GADK-), lowest
-         unused integer in the appropriate range (NNN for tool scope,
-         1NN for agent/subagent, 2NN for repo).
+       - `scope`: the candidate's scope verbatim.
        - `sdk`: one of {sorted(SDK_TO_TOOL_TOKEN.keys())}.
-       - `applies_to`: must include the matching tool token from this
-         map: {SDK_TO_TOOL_TOKEN}.
-       - `severity`, `confidence`, `match`, `explanation`, `fix`: per
-         the authoring contract below.
+       - `id`: matching SDK ID prefix (CSDK- / OAI- / ADK-), lowest unused
+         integer in the range for the scope: 0NN for tool, 1NN for
+         agent/subagent, 2NN for repo. (skill: reuse the 1NN block,
+         provisional.)
+       - `applies_to`: a non-empty subset of the tokens valid for this
+         scope+sdk. Token sets by scope:
+           tool:     {SDK_TO_TOOL_TOKEN}
+           agent:    {agent_tokens}
+           subagent: ["{SUBAGENT_TOKEN}"] (claude_agent_sdk only)
+           repo:     {SDK_TO_REPO_TOKEN}
+           skill:    {SDK_TO_SKILL_TOKEN} (provisional)
+       - `match`: use ONLY predicates from schema.yaml that are valid for
+         this scope (e.g. agent_*/agent_grants_builtin_tool for agent,
+         subagent_grants_tool for subagent, repo_component_present/
+         repo_has_sdk_in_code for repo). Never invent a YAML key.
+       - `severity`, `confidence`, `explanation`, `fix`: per the contract.
   4. Compose the rationale Markdown body per the template (every section,
      no skips). Inside "Real-world consequence" cite at least two
      callsites with full GitHub URLs of the form
      https://github.com/<repo>/blob/<ref>/<file_path>#L<line> built from
-     the list_candidate_patterns examples. Pick OWASP LLM Top 10:2025 IDs
-     anchoring the rule (LLM01..LLM10). Decide fix_type ('config' if the
-     fix is hooks/guardrails/sandbox/agent kwargs, 'code' if it requires
-     tool source edits). Then call write_rule_yaml(draft, topic,
+     the list_candidate_patterns examples (skip for repo candidates, which
+     have no callsite). Pick OWASP LLM Top 10:2025 IDs anchoring the rule
+     (LLM01..LLM10). Decide fix_type ('config' if the fix is
+     hooks/guardrails/sandbox/agent kwargs/frontmatter, 'code' if it
+     requires source edits). Then call write_rule_yaml(draft, topic,
      rationale_md, owasp_refs, fix_type). On REJECTED, fix the reported
      issue and retry once; if still rejected, skip and move on.
+
+SKILL note: skill-scope rules are PROVISIONAL — the engine cannot evaluate
+them yet. If you draft one, say so in its explanation ("Provisional: skill
+scanning lands in a future engine release").
 
 Stop when every candidate has been processed. Print a final summary
 listing every rule_id written and the file path it landed in, then

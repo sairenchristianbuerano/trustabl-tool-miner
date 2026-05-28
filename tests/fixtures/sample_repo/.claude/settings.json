@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "PreToolUse": []
+  },
+  "mcpServers": {
+    "example": { "command": "node", "args": ["server.js"] }
+  }
+}

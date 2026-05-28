@@ -23,13 +23,59 @@ SDK_TO_TOOL_TOKEN = {
     "google_adk": "adk_function_tool",
 }
 
+# Per-scope applies_to tokens, keyed by miner-internal sdk. Values mirror the
+# engine loader's validAppliesToForScope (see schema.yaml + the rules-repo
+# CLAUDE.md "Per-scope applies_to values" tables). A drafted rule's applies_to
+# must be a non-empty subset of the set for its scope+sdk.
+SDK_TO_AGENT_TOKENS = {
+    "openai_agents": {"openai_agent", "openai_sandbox_agent"},
+    "claude_agent_sdk": {"claude_agent_definition"},
+    "google_adk": {
+        "adk_llm_agent", "adk_sequential_agent", "adk_parallel_agent",
+        "adk_loop_agent", "adk_langgraph_agent",
+    },
+}
+# Subagents are a Claude Code concept only (.claude/agents/*.md frontmatter).
+SUBAGENT_TOKEN = "claude_subagent"
+# Repo-scope applies_to uses the *category* token (distinct from the SDK enum
+# used by the repo_has_sdk_in_code predicate).
+SDK_TO_REPO_TOKEN = {
+    "openai_agents": "openai_agents",
+    "claude_agent_sdk": "claude_sdk",
+    "google_adk": "google_adk",
+}
+# Provisional — skills are not an engine scope yet (next trustabl release).
+# Gated behind --enable-skills; align this token to the engine schema when it
+# ships. Until then drafted skill rules are marked provisional.
+SDK_TO_SKILL_TOKEN = {
+    "openai_agents": "skill",
+    "claude_agent_sdk": "skill",
+    "google_adk": "skill",
+}
+
+
+def valid_applies_to(sdk: str, scope: str) -> set[str]:
+    """Return the allowed applies_to tokens for a rule's scope + sdk."""
+    if scope == "tool":
+        return {SDK_TO_TOOL_TOKEN[sdk]}
+    if scope == "agent":
+        return set(SDK_TO_AGENT_TOKENS[sdk])
+    if scope == "subagent":
+        return {SUBAGENT_TOKEN}
+    if scope == "repo":
+        return {SDK_TO_REPO_TOKEN[sdk]}
+    if scope == "skill":
+        return {SDK_TO_SKILL_TOKEN[sdk]}
+    return set()
+
 
 @dataclass
 class CandidatePattern:
     sdk: str
     feature: str
     occurrence_count: int
-    example_callsites: list[tuple[str, int, str]]  # (file, line, tool_name)
+    example_callsites: list[tuple[str, int, str]]  # (file, line, entity_name)
+    scope: str = "tool"
 
 
 @dataclass
@@ -45,10 +91,11 @@ def list_candidate_patterns(state: MiningState) -> str:
     payload = [
         {
             "sdk": c.sdk,
+            "scope": c.scope,
             "feature": c.feature,
             "occurrences": c.occurrence_count,
             "examples": [
-                {"file": f, "line": ln, "tool_name": n}
+                {"file": f, "line": ln, "name": n}
                 for f, ln, n in c.example_callsites[:5]
             ],
         }
@@ -127,21 +174,27 @@ def write_rule_yaml(
             f"got {sdk!r}"
         )
 
-    expected_token = SDK_TO_TOOL_TOKEN[sdk]
-    applies_to = draft.get("applies_to") or []
-    if not isinstance(applies_to, list) or expected_token not in applies_to:
+    scope = draft.get("scope", "tool")
+    if scope not in {"tool", "agent", "subagent", "repo", "skill"}:
         return (
-            f"REJECTED: applies_to must include {expected_token!r} for sdk "
-            f"{sdk!r}"
+            "REJECTED: scope must be tool|agent|subagent|repo|skill, "
+            f"got {scope!r}"
+        )
+
+    allowed_tokens = valid_applies_to(sdk, scope)
+    applies_to = draft.get("applies_to") or []
+    if not isinstance(applies_to, list) or not applies_to:
+        return "REJECTED: applies_to must be a non-empty list"
+    extra = set(applies_to) - allowed_tokens
+    if extra:
+        return (
+            f"REJECTED: applies_to {sorted(extra)} not valid for scope "
+            f"{scope!r} + sdk {sdk!r}; allowed: {sorted(allowed_tokens)}"
         )
 
     existing = patterns.load_existing_rule_ids(state.repo_root)
     if draft["id"] in existing:
         return f"REJECTED: id {draft['id']} already exists in the rule pack"
-
-    scope = draft.get("scope", "tool")
-    if scope not in {"tool", "agent", "subagent", "repo"}:
-        return f"REJECTED: scope must be tool|agent|subagent|repo, got {scope!r}"
 
     if not topic or "/" in topic or "\\" in topic or topic.endswith(".yaml"):
         return "REJECTED: topic must be a bare filename stem (no slashes, no .yaml)"
@@ -275,7 +328,9 @@ def _canonicalize_rule(draft: dict, scope: str) -> dict:
     """Reorder + default-fill fields to match the canonical shipped shape
     (id, title, scope, severity, confidence, language, applies_to, match,
     explanation, fix). Strips `sdk` (miner-internal). Defaults `language`
-    to `python` per CLAUDE.md.
+    to `python` per CLAUDE.md, but omits it for subagent/skill scopes —
+    those are markdown frontmatter, not code, and the engine's subagent
+    detector does not gate on language.
     """
     out: dict = {}
     out["id"] = draft["id"]
@@ -283,7 +338,8 @@ def _canonicalize_rule(draft: dict, scope: str) -> dict:
     out["scope"] = scope
     out["severity"] = draft["severity"]
     out["confidence"] = float(draft["confidence"])
-    out["language"] = draft.get("language", "python")
+    if scope not in {"subagent", "skill"}:
+        out["language"] = draft.get("language", "python")
     out["applies_to"] = list(draft["applies_to"])
     out["match"] = draft["match"]
     out["explanation"] = draft["explanation"]

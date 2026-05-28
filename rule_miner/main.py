@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import (
     agent,
+    component_scanner,
     discover,
     heartbeat,
     patterns,
@@ -24,6 +25,7 @@ from . import (
     scanner,
     trustabl_scanner,
 )
+from .component_scanner import RepoComponents
 from .tools import CandidatePattern, MiningState
 
 CACHE_ROOT = Path.home() / ".cache" / "trustabl-rule-miner"
@@ -62,6 +64,22 @@ def cli() -> int:
         default=3,
         help="Minimum occurrences of an uncovered feature to surface as "
         "a candidate (default: 3).",
+    )
+    parser.add_argument(
+        "--repo-min-occurrences",
+        type=int,
+        default=2,
+        help="Minimum number of repos exhibiting a repo-scope gap to surface "
+        "it as a candidate (default: 2). Repo features are per-repo booleans, "
+        "so this is a separate, lower threshold than --min-occurrences.",
+    )
+    parser.add_argument(
+        "--enable-skills",
+        action="store_true",
+        help="Mine .claude/skills/**/SKILL.md and draft skill-scope rules. "
+        "Off by default: the trustabl engine cannot evaluate skill rules yet, "
+        "so drafted skill rules are marked provisional until engine support "
+        "ships.",
     )
     parser.add_argument(
         "--dry-run",
@@ -234,6 +252,8 @@ def cli() -> int:
     all_records = []
     all_agents: list = []
     all_subagents: list = []
+    all_skills: list = []
+    all_repo_ctx: list[tuple[RepoComponents, set[str], bool]] = []
     clones_to_clean: list[Path] = []
     deadline = (
         time.monotonic() + args.max_runtime_seconds
@@ -261,8 +281,8 @@ def cli() -> int:
                 continue
             roots = [clone_path / p for p in tgt["paths"]]
             records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
-            tr_agents: list = []
-            tr_subagents: list = []
+            tgt_agents: list = []
+            tgt_subagents: list = []
             if trustabl_enabled:
                 try:
                     tr = trustabl_scanner.scan(tgt["repo"], clone_path)
@@ -273,31 +293,54 @@ def cli() -> int:
                     merged = trustabl_scanner.merge_tools(records, tr.tools)
                     added = len(merged) - len(records)
                     records = merged
-                    tr_agents = tr.agents
-                    tr_subagents = tr.subagents
-                    all_agents.extend(tr_agents)
-                    all_subagents.extend(tr_subagents)
+                    tgt_agents = tr.agents
+                    tgt_subagents = tr.subagents
                     print(
                         f"  {tgt['repo']}: trustabl +{added} tools, "
-                        f"{len(tr_agents)} agents, {len(tr_subagents)} subagents",
+                        f"{len(tgt_agents)} agents, {len(tgt_subagents)} subagents",
                         file=sys.stderr,
                     )
-            print(f"  {tgt['repo']}: {len(records)} tools", file=sys.stderr)
+            else:
+                # Self-owned pure-Python inventory of non-tool entities.
+                tgt_agents = component_scanner.scan_agents(tgt["repo"], roots)
+                tgt_subagents = component_scanner.scan_subagents(
+                    tgt["repo"], clone_path
+                )
+            all_agents.extend(tgt_agents)
+            all_subagents.extend(tgt_subagents)
+
+            components = component_scanner.scan_components(tgt["repo"], clone_path)
+            tgt_skills = (
+                component_scanner.scan_skills(tgt["repo"], clone_path)
+                if args.enable_skills else []
+            )
+            all_skills.extend(tgt_skills)
+            has_shell = any(
+                c.startswith("subprocess.") or c in ("os.system", "os.popen")
+                for rec in records for c in rec.body_call_targets
+            )
+            all_repo_ctx.append((components, {tgt["sdk"]}, has_shell))
+
+            print(
+                f"  {tgt['repo']}: {len(records)} tools, {len(tgt_agents)} agents, "
+                f"{len(tgt_subagents)} subagents, {len(tgt_skills)} skills",
+                file=sys.stderr,
+            )
             all_records.extend(records)
             scanned_log.record(
                 repo=tgt["repo"],
                 ref=tgt.get("ref", "main"),
                 tools=len(records),
-                agents=len(tr_agents),
-                subagents=len(tr_subagents),
+                agents=len(tgt_agents),
+                subagents=len(tgt_subagents),
             )
             if not args.keep_clones:
                 clones_to_clean.append(clone_path)
             if hb:
                 hb.add_counts(
                     tools=len(records),
-                    agents=len(tr_agents),
-                    subagents=len(tr_subagents),
+                    agents=len(tgt_agents),
+                    subagents=len(tgt_subagents),
                 )
                 hb.target_done()
     finally:
@@ -309,7 +352,16 @@ def cli() -> int:
     for sdk, feats in sorted(covered.items()):
         if feats:
             print(f"  covered({sdk}): {sorted(feats)}", file=sys.stderr)
-    candidates = _aggregate_candidates(all_records, args.min_occurrences, covered)
+    candidates = _aggregate_candidates(
+        all_records,
+        all_agents,
+        all_subagents,
+        all_skills,
+        all_repo_ctx,
+        args.min_occurrences,
+        covered,
+        repo_min=args.repo_min_occurrences,
+    )
     if not candidates:
         print("no uncovered patterns crossed the threshold; nothing to draft.",
               file=sys.stderr)
@@ -431,24 +483,70 @@ def _ensure_clone(repo: str, ref: str) -> Path:
 
 def _aggregate_candidates(
     records: list[scanner.ToolRecord],
+    agents: list,
+    subagents: list,
+    skills: list,
+    repo_ctx: list[tuple[RepoComponents, set[str], bool]],
     min_occurrences: int,
     covered: dict[str, set[str]] | None = None,
+    repo_min: int = 2,
 ) -> list[CandidatePattern]:
-    buckets: dict[tuple[str, str], list[scanner.ToolRecord]] = defaultdict(list)
+    # bucket key: (sdk, scope, feature) -> list[(file, line, name)]
+    buckets: dict[tuple[str, str, str], list[tuple[str, int, str]]] = (
+        defaultdict(list)
+    )
+
     for rec in records:
         for feature in patterns.uncovered_features(rec, covered):
-            buckets[(rec.sdk, feature)].append(rec)
+            buckets[(rec.sdk, "tool", feature)].append(
+                (rec.file, rec.line, rec.name)
+            )
+
+    for a in agents:
+        present = patterns.agent_features_present(a)
+        for feature in patterns.uncovered_scoped("agent", a.sdk, present, covered):
+            buckets[(a.sdk, "agent", feature)].append((a.file, a.line, a.name))
+
+    for s in subagents:
+        present = patterns.subagent_features_present(s)
+        for feature in patterns.uncovered_scoped(
+            "subagent", "claude_agent_sdk", present, covered
+        ):
+            buckets[("claude_agent_sdk", "subagent", feature)].append(
+                (s.file, 0, s.name)
+            )
+
+    for sk in skills:
+        present = patterns.skill_features_present(sk)
+        for feature in patterns.uncovered_scoped(
+            "skill", "claude_agent_sdk", present, covered
+        ):
+            buckets[("claude_agent_sdk", "skill", feature)].append(
+                (sk.file, 0, sk.name)
+            )
+
+    for components, sdks_in_repo, has_shell in repo_ctx:
+        feats = patterns.repo_features(components, sdks_in_repo, has_shell)
+        for feature in feats:
+            for sdk in sdks_in_repo:
+                if f"repo:{feature}" in (covered or {}).get(sdk, set()):
+                    continue
+                buckets[(sdk, "repo", feature)].append(
+                    (components.repo, 0, components.repo)
+                )
 
     out: list[CandidatePattern] = []
-    for (sdk, feature), recs in buckets.items():
-        if len(recs) < min_occurrences:
+    for (sdk, scope, feature), locs in buckets.items():
+        threshold = repo_min if scope == "repo" else min_occurrences
+        if len(locs) < threshold:
             continue
         out.append(
             CandidatePattern(
                 sdk=sdk,
                 feature=feature,
-                occurrence_count=len(recs),
-                example_callsites=[(r.file, r.line, r.name) for r in recs],
+                occurrence_count=len(locs),
+                example_callsites=locs,
+                scope=scope,
             )
         )
     out.sort(key=lambda c: c.occurrence_count, reverse=True)

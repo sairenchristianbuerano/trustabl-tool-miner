@@ -16,7 +16,9 @@ from typing import Callable
 
 import yaml
 
+from .component_scanner import RepoComponents, SkillRecord
 from .scanner import ToolRecord
+from .trustabl_scanner import AgentRecord, SubagentRecord
 
 SDK_DIRS = {
     "openai_agents": "openai_sdk",
@@ -83,6 +85,57 @@ FEATURE_CHECKS: dict[str, Callable[[ToolRecord], bool]] = {
     ),
 }
 
+# ── Non-tool scope feature checks ───────────────────────────────────────
+# Feature names here are namespaced "<scope>:<feature>" in coverage/candidate
+# bookkeeping so they never collide with tool features (e.g. an agent's
+# grants_bash is distinct from a subagent's grants_bash).
+
+def _agent_missing_guardrails(a: AgentRecord) -> bool:
+    # OpenAI Agents SDK is the only one with first-class input/output
+    # guardrail kwargs. A non-empty value means guarded.
+    if a.sdk != "openai_agents":
+        return False
+    for k in ("input_guardrails", "output_guardrails"):
+        v = a.kwargs.get(k)
+        if v and v not in ("[]", "None", "()", "{}"):
+            return False
+    return True
+
+
+AGENT_FEATURE_CHECKS: dict[str, Callable[[AgentRecord], bool]] = {
+    "missing_guardrails": _agent_missing_guardrails,
+    "grants_bash": lambda a: "Bash" in a.tool_grants,
+    "grants_websearch": lambda a: "WebSearch" in a.tool_grants,
+    "no_model_pinned": lambda a: "model" not in a.kwargs,
+}
+
+SUBAGENT_FEATURE_CHECKS: dict[str, Callable[[SubagentRecord], bool]] = {
+    "grants_bash": lambda s: "Bash" in s.tools,
+    "grants_write": lambda s: "Write" in s.tools,
+    "grants_bash_and_write": lambda s: "Bash" in s.tools and "Write" in s.tools,
+    "grants_webfetch": lambda s: bool({"WebFetch", "WebSearch"} & set(s.tools)),
+}
+
+SKILL_FEATURE_CHECKS: dict[str, Callable[[SkillRecord], bool]] = {
+    "skill_no_description": lambda s: not s.description.strip(),
+    "skill_grants_broad_tools": lambda s: not s.allowed_tools,
+}
+
+
+def repo_features(
+    components: RepoComponents, sdks_in_repo: set[str], has_shell: bool
+) -> set[str]:
+    """Per-repo gaps. Returns bare feature names (caller namespaces)."""
+    feats: set[str] = set()
+    if sdks_in_repo and not components.claude_md:
+        feats.add("uses_sdk_no_claude_md")
+    if components.subagent and not components.claude_settings:
+        feats.add("subagents_no_settings")
+    if has_shell and not components.claude_settings:
+        feats.add("shell_tools_no_settings")
+    return feats
+
+
 # Body-text fragments that, when present in a rule's match.has_body_text,
 # indicate the rule already covers that feature. Compared against shipped
 # YAMLs at runtime in derive_covered_features() — replaces the old
@@ -138,6 +191,27 @@ def features_present(tool: ToolRecord) -> set[str]:
     return {name for name, check in FEATURE_CHECKS.items() if check(tool)}
 
 
+def agent_features_present(agent: AgentRecord) -> set[str]:
+    return {n for n, chk in AGENT_FEATURE_CHECKS.items() if chk(agent)}
+
+
+def subagent_features_present(sub: SubagentRecord) -> set[str]:
+    return {n for n, chk in SUBAGENT_FEATURE_CHECKS.items() if chk(sub)}
+
+
+def skill_features_present(skill: SkillRecord) -> set[str]:
+    return {n for n, chk in SKILL_FEATURE_CHECKS.items() if chk(skill)}
+
+
+def uncovered_scoped(
+    scope: str, sdk: str, present: set[str], covered: dict[str, set[str]] | None
+) -> set[str]:
+    """Bare feature names in `present` not covered for (sdk, scope). Coverage
+    is stored namespaced "<scope>:<feature>" for non-tool scopes."""
+    sdk_covered = (covered or {}).get(sdk, set())
+    return {f for f in present if f"{scope}:{f}" not in sdk_covered}
+
+
 def uncovered_features(
     tool: ToolRecord,
     covered: dict[str, set[str]] | None = None,
@@ -176,40 +250,78 @@ def derive_covered_features(repo_root: Path) -> dict[str, set[str]]:
             for rule in doc.get("rules", []) or []:
                 if not isinstance(rule, dict):
                     continue
-                applies = rule.get("applies_to") or []
-                tool_token = SDK_TO_APPLIES_TO.get(sdk)
-                if tool_token and tool_token not in applies:
-                    continue
                 match = rule.get("match") or {}
                 if not isinstance(match, dict):
                     continue
-                _attribute_coverage(covered[sdk], match)
+                applies = rule.get("applies_to") or []
+                tool_token = SDK_TO_APPLIES_TO.get(sdk)
+                is_tool_rule = not tool_token or tool_token in applies
+                _attribute_coverage(covered[sdk], match, is_tool_rule)
     return covered
 
 
-def _attribute_coverage(bucket: set[str], match: dict) -> None:
-    keys, body_texts, param_values = _collect_match_signals(match)
+def _attribute_coverage(
+    bucket: set[str], match: dict, is_tool_rule: bool = True
+) -> None:
+    keys, body_texts, param_values, pred_values = _collect_match_signals(match)
 
-    body_blob = " ".join(body_texts)
-    for feature, fragments in BODY_TEXT_SIGNATURES.items():
-        if any(frag in body_blob for frag in fragments):
-            bucket.add(feature)
+    # Tool-feature attribution is gated on the rule actually being a
+    # tool-scope rule for this SDK's tool kind — otherwise an mcp_tool rule
+    # in the same dir would wrongly mark openai_tool features covered.
+    if is_tool_rule:
+        body_blob = " ".join(body_texts)
+        for feature, fragments in BODY_TEXT_SIGNATURES.items():
+            if any(frag in body_blob for frag in fragments):
+                bucket.add(feature)
 
-    param_blob = " ".join(param_values)
-    for feature, fragments in PARAM_NAME_SIGNATURES.items():
-        if any(frag in param_blob for frag in fragments):
-            bucket.add(feature)
+        param_blob = " ".join(param_values)
+        for feature, fragments in PARAM_NAME_SIGNATURES.items():
+            if any(frag in param_blob for frag in fragments):
+                bucket.add(feature)
 
-    for feature, key_options in MATCH_KEY_SIGNATURES.items():
-        if keys & set(key_options):
-            bucket.add(feature)
+        for feature, key_options in MATCH_KEY_SIGNATURES.items():
+            if keys & set(key_options):
+                bucket.add(feature)
+
+    # Agent/subagent coverage is namespaced and always attributed.
+    _attribute_new_scope_coverage(bucket, keys, pred_values)
+
+
+def _attribute_new_scope_coverage(
+    bucket: set[str], keys: set[str], pred_values: dict[str, list[str]]
+) -> None:
+    """Attribute agent/subagent coverage from list-valued predicates. Feature
+    names are namespaced "<scope>:<feature>" to match the candidate side."""
+    sub_tools = set(pred_values.get("subagent_grants_tool", []))
+    if "Bash" in sub_tools:
+        bucket.add("subagent:grants_bash")
+    if "Write" in sub_tools:
+        bucket.add("subagent:grants_write")
+    if {"Bash", "Write"} <= sub_tools:
+        bucket.add("subagent:grants_bash_and_write")
+    if sub_tools & {"WebFetch", "WebSearch"}:
+        bucket.add("subagent:grants_webfetch")
+
+    agent_tools = set(pred_values.get("agent_grants_builtin_tool", []))
+    agent_tools |= set(pred_values.get("agent_uses_hosted_tool_class", []))
+    if "Bash" in agent_tools:
+        bucket.add("agent:grants_bash")
+    if "WebSearch" in agent_tools:
+        bucket.add("agent:grants_websearch")
+
+    if keys & {"agent_kwarg_list_empty", "agent_kwarg_missing"}:
+        guard_vals = set(pred_values.get("agent_kwarg_list_empty", []))
+        guard_vals |= set(pred_values.get("agent_kwarg_missing", []))
+        if guard_vals & {"input_guardrails", "output_guardrails"}:
+            bucket.add("agent:missing_guardrails")
 
 
 def _collect_match_signals(
     node: object,
-) -> tuple[set[str], list[str], list[str]]:
-    """Recursively gather predicate keys, has_body_text fragments, and
-    param_name_matches values from a match block.
+) -> tuple[set[str], list[str], list[str], dict[str, list[str]]]:
+    """Recursively gather predicate keys, has_body_text fragments,
+    param_name_matches values, and per-predicate scalar list values from a
+    match block.
 
     Descends through all/any/not combinators so a predicate nested inside
     a boolean group (the common case) is still attributed. Without this,
@@ -219,6 +331,7 @@ def _collect_match_signals(
     keys: set[str] = set()
     body: list[str] = []
     params: list[str] = []
+    pred_values: dict[str, list[str]] = {}
     if isinstance(node, dict):
         for key, value in node.items():
             keys.add(key)
@@ -230,17 +343,29 @@ def _collect_match_signals(
                         params.extend(str(x) for x in sub)
                     else:
                         params.append(str(sub))
-            sub_keys, sub_body, sub_params = _collect_match_signals(value)
+            elif isinstance(value, list) and all(
+                isinstance(x, (str, int, float, bool)) for x in value
+            ):
+                pred_values.setdefault(key, []).extend(str(x) for x in value)
+            sub_keys, sub_body, sub_params, sub_pred = _collect_match_signals(
+                value
+            )
             keys |= sub_keys
             body.extend(sub_body)
             params.extend(sub_params)
+            for k, v in sub_pred.items():
+                pred_values.setdefault(k, []).extend(v)
     elif isinstance(node, list):
         for item in node:
-            sub_keys, sub_body, sub_params = _collect_match_signals(item)
+            sub_keys, sub_body, sub_params, sub_pred = _collect_match_signals(
+                item
+            )
             keys |= sub_keys
             body.extend(sub_body)
             params.extend(sub_params)
-    return keys, body, params
+            for k, v in sub_pred.items():
+                pred_values.setdefault(k, []).extend(v)
+    return keys, body, params, pred_values
 
 
 def load_existing_rule_ids(repo_root: Path) -> set[str]:
