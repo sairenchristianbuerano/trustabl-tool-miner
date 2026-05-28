@@ -116,6 +116,17 @@ MATCH_KEY_SIGNATURES: dict[str, tuple[str, ...]] = {
     "mutable_default_arg": ("has_mutable_default", "mutable_default"),
 }
 
+# param_name_matches values that signal a feature is already covered. A rule
+# that inspects a tool's parameter names for these tokens is enforcing that
+# feature (e.g. an idempotency rule checks params for `idempot`/`request_id`).
+# Compared against the flattened contains/exact values of every
+# param_name_matches predicate found anywhere in the match tree.
+PARAM_NAME_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "mutating_prefix_no_idempotency_kwarg": (
+        "idempot", "request_id", "txn_id",
+    ),
+}
+
 SDK_TO_APPLIES_TO = {
     "openai_agents": "openai_tool",
     "claude_agent_sdk": "claude_sdk_tool",
@@ -177,16 +188,59 @@ def derive_covered_features(repo_root: Path) -> dict[str, set[str]]:
 
 
 def _attribute_coverage(bucket: set[str], match: dict) -> None:
-    body_texts = match.get("has_body_text") or []
-    if isinstance(body_texts, list):
-        body_blob = " ".join(str(t) for t in body_texts)
-        for feature, fragments in BODY_TEXT_SIGNATURES.items():
-            if any(frag in body_blob for frag in fragments):
-                bucket.add(feature)
-    match_keys = set(match.keys())
-    for feature, key_options in MATCH_KEY_SIGNATURES.items():
-        if match_keys & set(key_options):
+    keys, body_texts, param_values = _collect_match_signals(match)
+
+    body_blob = " ".join(body_texts)
+    for feature, fragments in BODY_TEXT_SIGNATURES.items():
+        if any(frag in body_blob for frag in fragments):
             bucket.add(feature)
+
+    param_blob = " ".join(param_values)
+    for feature, fragments in PARAM_NAME_SIGNATURES.items():
+        if any(frag in param_blob for frag in fragments):
+            bucket.add(feature)
+
+    for feature, key_options in MATCH_KEY_SIGNATURES.items():
+        if keys & set(key_options):
+            bucket.add(feature)
+
+
+def _collect_match_signals(
+    node: object,
+) -> tuple[set[str], list[str], list[str]]:
+    """Recursively gather predicate keys, has_body_text fragments, and
+    param_name_matches values from a match block.
+
+    Descends through all/any/not combinators so a predicate nested inside
+    a boolean group (the common case) is still attributed. Without this,
+    a rule like `match: {all: [{name_has_prefix: ...}, {not: ...}]}` looks
+    like it only has the key `all` and its real predicates are invisible.
+    """
+    keys: set[str] = set()
+    body: list[str] = []
+    params: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(key)
+            if key == "has_body_text" and isinstance(value, list):
+                body.extend(str(t) for t in value)
+            elif key == "param_name_matches" and isinstance(value, dict):
+                for sub in value.values():
+                    if isinstance(sub, list):
+                        params.extend(str(x) for x in sub)
+                    else:
+                        params.append(str(sub))
+            sub_keys, sub_body, sub_params = _collect_match_signals(value)
+            keys |= sub_keys
+            body.extend(sub_body)
+            params.extend(sub_params)
+    elif isinstance(node, list):
+        for item in node:
+            sub_keys, sub_body, sub_params = _collect_match_signals(item)
+            keys |= sub_keys
+            body.extend(sub_body)
+            params.extend(sub_params)
+    return keys, body, params
 
 
 def load_existing_rule_ids(repo_root: Path) -> set[str]:

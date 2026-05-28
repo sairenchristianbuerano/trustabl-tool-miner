@@ -65,18 +65,25 @@ async def _t_read_callsite(args: dict) -> dict:
     "template guide. Appends YAML to <rules_repo>/<sdk_dir>/<topic>.yaml "
     "AND writes the matching <rules_repo>/docs/Policy/<sdk_dir>/<topic>.md "
     "(template at docs/policy-rationale-doc-template-guide.md). "
-    "`draft` MUST match the shipped YAML shape exactly (see "
-    "`openai_sdk/observability.yaml` for OAI-010 as the canonical "
-    "example). Required keys: id, title, severity (low|medium|high), "
-    "confidence (0..1), applies_to (list — must include the SDK's tool "
-    "token: openai_tool / claude_sdk_tool / adk_function_tool), match "
-    "(dict — e.g. `{has_body_text: [\"print(\"]}`), explanation (str, "
-    "single paragraph naming the consequence), fix (str, prescribes the "
-    "concrete change). Plus miner-internal `sdk` (openai_agents | "
-    "claude_agent_sdk | google_adk). Optional: scope (default `tool`), "
-    "language (default `python`). The tool reorders keys into the "
-    "canonical order before writing. `topic`: bare filename stem. "
-    "`rationale_md`: full "
+    "`draft` MUST match the trustabl rule schema (see `schema.yaml` at "
+    "the rule-miner repo root for the full annotated reference). "
+    "Required keys: id, title, severity "
+    "(low|medium|high|critical — `info` reserved), confidence (0..1], "
+    "applies_to (list — tool-scope: openai_tool / claude_sdk_tool / "
+    "adk_function_tool / mcp_tool / shell_invocation), match (dict — "
+    "use predicates from schema.yaml: has_body_text, has_docstring, "
+    "call_without_kwarg, param_name_matches, all/any/not, etc.), "
+    "explanation (multi-paragraph naming the consequence), fix "
+    "(concrete remediation). Plus miner-internal `sdk` (openai_agents | "
+    "claude_agent_sdk | google_adk). Optional: scope (tool|agent|repo|"
+    "subagent, default `tool`), language (default `python`). "
+    "`policy_meta`: REQUIRED when topic file doesn't exist yet — dict "
+    "with id (lowercase_underscored, e.g. `openai_sdk_shell_safety`), "
+    "name (human title), category (must match sdk: openai_sdk / "
+    "claude_sdk / google_adk), description (multi-line intent). Omit "
+    "when appending a rule to an existing topic file. The tool reorders "
+    "keys into canonical schema order before writing. `topic`: bare "
+    "filename stem. `rationale_md`: full "
     "Markdown body BELOW the metadata block — 'What this policy covers', "
     "'Why <topic> is a distinct concern in agent tools' (threat model), "
     "'Rule-by-rule defense' with rule_id as H3 plus 'What we detect / Why "
@@ -93,6 +100,7 @@ async def _t_read_callsite(args: dict) -> dict:
         "rationale_md": str,
         "owasp_refs": list,
         "fix_type": str,
+        "policy_meta": dict,
     },
 )
 async def _t_write_rule(args: dict) -> dict:
@@ -103,15 +111,33 @@ async def _t_write_rule(args: dict) -> dict:
         rationale_md=args.get("rationale_md"),
         owasp_refs=args.get("owasp_refs"),
         fix_type=args.get("fix_type", "code"),
+        policy_meta=args.get("policy_meta"),
     )
     return {"content": [{"type": "text", "text": result}]}
 
 
+def _read_or_placeholder(path: Path, placeholder: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return placeholder
+
+
 def _system_prompt(repo_root: Path) -> str:
-    contract = (repo_root / "CLAUDE.md").read_text(encoding="utf-8")
-    template = (
-        repo_root / "docs" / "policy-rationale-doc-template-guide.md"
-    ).read_text(encoding="utf-8")
+    contract = _read_or_placeholder(
+        repo_root / "CLAUDE.md",
+        "<CLAUDE.md missing from rules repo>",
+    )
+    template = _read_or_placeholder(
+        repo_root / "docs" / "policy-rationale-doc-template-guide.md",
+        "<rationale doc template missing — fall back to schema.yaml + "
+        "write_rule_yaml tool description>",
+    )
+    miner_root = Path(__file__).resolve().parents[1]
+    schema = _read_or_placeholder(
+        miner_root / "schema.yaml",
+        "<schema.yaml missing from rule-miner root>",
+    )
     return f"""You are a rule-mining assistant for the Trustabl detection-rule
 pack. Your task: for each candidate pattern surfaced by
 list_candidate_patterns, write ONE rule directly into the local rules
@@ -155,6 +181,9 @@ testdata/rules-fixture/ per the authoring contract step 5.
 
 === Rationale doc template (verbatim) ===
 {template}
+
+=== Trustabl rule schema (verbatim from rule-miner schema.yaml) ===
+{schema}
 """
 
 

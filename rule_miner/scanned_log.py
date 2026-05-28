@@ -45,11 +45,13 @@ def record(
     tools: int,
     agents: int = 0,
     subagents: int = 0,
+    url: str | None = None,
     path: Path = DEFAULT_LOG,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "repo": repo,
+        "url": url or f"https://github.com/{repo}.git",
         "ref": ref,
         "tools": tools,
         "agents": agents,

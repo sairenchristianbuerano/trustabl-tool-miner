@@ -76,6 +76,7 @@ def write_rule_yaml(
     rationale_md: str | None = None,
     owasp_refs: list[str] | None = None,
     fix_type: str = "code",
+    policy_meta: dict | None = None,
 ) -> str:
     """Validate `draft`, append it to <rules_repo>/<sdk_dir>/<topic>.yaml,
     AND write the paired rationale doc at
@@ -109,8 +110,11 @@ def write_rule_yaml(
     if missing:
         return f"REJECTED: missing required fields: {sorted(missing)}"
 
-    if draft["severity"] not in {"low", "medium", "high"}:
-        return "REJECTED: severity must be low|medium|high (info is reserved)"
+    if draft["severity"] not in {"low", "medium", "high", "critical"}:
+        return (
+            "REJECTED: severity must be low|medium|high|critical "
+            "(info is reserved per schema.yaml)"
+        )
     if not isinstance(draft["confidence"], (int, float)):
         return "REJECTED: confidence must be a number 0..1"
     if not 0 <= float(draft["confidence"]) <= 1:
@@ -145,9 +149,6 @@ def write_rule_yaml(
     sdk_dir = state.repo_root / patterns.SDK_DIRS[sdk]
     path = sdk_dir / f"{topic}.yaml"
 
-    # Canonical key order matches shipped rules like
-    # openai_sdk/observability.yaml (OAI-010). Stable order = stable diffs
-    # and the engine's YAML schema reads identical files either way.
     persisted = _canonicalize_rule(draft, scope)
 
     if path.exists():
@@ -161,7 +162,16 @@ def write_rule_yaml(
         rules.append(persisted)
         doc["rules"] = rules
     else:
-        doc = {"rules": [persisted]}
+        # New topic file: schema.yaml requires top-level policy: wrapper
+        # (id/name/category/description) plus rules:. Agent supplies via
+        # policy_meta — reject if missing on a fresh file.
+        meta_err = _validate_policy_meta(policy_meta, sdk)
+        if meta_err:
+            return meta_err
+        doc = {
+            "policy": _canonicalize_policy(policy_meta, sdk),
+            "rules": [persisted],
+        }
 
     rendered = yaml.safe_dump(doc, sort_keys=False, indent=2)
 
@@ -214,6 +224,51 @@ def write_rule_yaml(
     return (
         f"WROTE: {draft['id']} -> {path} + rationale {rationale_path}{warn_suffix}"
     )
+
+
+_VALID_CATEGORIES = {"claude_sdk", "openai_sdk", "google_adk", "openshell", "mcp"}
+_SDK_TO_CATEGORY = {
+    "openai_agents": "openai_sdk",
+    "claude_agent_sdk": "claude_sdk",
+    "google_adk": "google_adk",
+}
+
+
+def _validate_policy_meta(meta: dict | None, sdk: str) -> str | None:
+    if not isinstance(meta, dict):
+        return (
+            "REJECTED: new topic file requires policy_meta dict with id, "
+            "name, category, description (per schema.yaml top-level policy:)"
+        )
+    required = {"id", "name", "category", "description"}
+    missing = required - set(meta.keys())
+    if missing:
+        return f"REJECTED: policy_meta missing fields: {sorted(missing)}"
+    pid = meta["id"]
+    if not isinstance(pid, str) or not pid.islower() or " " in pid:
+        return "REJECTED: policy_meta.id must be lowercase_underscored"
+    cat = meta["category"]
+    if cat not in _VALID_CATEGORIES:
+        return (
+            f"REJECTED: policy_meta.category must be one of "
+            f"{sorted(_VALID_CATEGORIES)}, got {cat!r}"
+        )
+    expected = _SDK_TO_CATEGORY[sdk]
+    if cat != expected:
+        return (
+            f"REJECTED: policy_meta.category {cat!r} does not match sdk "
+            f"{sdk!r} (expected {expected!r})"
+        )
+    return None
+
+
+def _canonicalize_policy(meta: dict, sdk: str) -> dict:
+    return {
+        "id": meta["id"],
+        "name": meta["name"],
+        "category": meta["category"],
+        "description": meta["description"],
+    }
 
 
 def _canonicalize_rule(draft: dict, scope: str) -> dict:
