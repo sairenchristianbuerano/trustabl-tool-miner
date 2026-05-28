@@ -106,7 +106,6 @@ AGENT_FEATURE_CHECKS: dict[str, Callable[[AgentRecord], bool]] = {
     "missing_guardrails": _agent_missing_guardrails,
     "grants_bash": lambda a: "Bash" in a.tool_grants,
     "grants_websearch": lambda a: "WebSearch" in a.tool_grants,
-    "no_model_pinned": lambda a: "model" not in a.kwargs,
 }
 
 SUBAGENT_FEATURE_CHECKS: dict[str, Callable[[SubagentRecord], bool]] = {
