@@ -314,6 +314,15 @@ def _attribute_new_scope_coverage(
         if guard_vals & {"input_guardrails", "output_guardrails"}:
             bucket.add("agent:missing_guardrails")
 
+    # Repo coverage: a rule that inspects a repo component (typically under a
+    # `not`, e.g. "fires when claude_md absent") covers that repo feature.
+    comp = set(pred_values.get("repo_component_present", []))
+    if "claude_md" in comp:
+        bucket.add("repo:uses_sdk_no_claude_md")
+    if "claude_settings" in comp:
+        bucket.add("repo:subagents_no_settings")
+        bucket.add("repo:shell_tools_no_settings")
+
 
 def _collect_match_signals(
     node: object,
