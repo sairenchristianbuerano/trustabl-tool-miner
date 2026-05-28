@@ -5,6 +5,7 @@ trustabl-rules pack."""
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -80,6 +81,36 @@ def cli() -> int:
         "Off by default: the trustabl engine cannot evaluate skill rules yet, "
         "so drafted skill rules are marked provisional until engine support "
         "ships.",
+    )
+    parser.add_argument(
+        "--target-policies",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Goal mode: keep scanning repos in batches until N distinct "
+        "policy files (topic .yaml) have been created, then stop. Records each "
+        "scanned repo to the scanned-log (history, no revisits) and cleans its "
+        "clone between rounds to bound disk. Recomputes coverage each round so "
+        "rules written earlier silence their own candidates (no duplicates). "
+        "When the local target list is exhausted before N, pair with "
+        "--discover to replenish (capped by --max-discover-rounds); otherwise "
+        "stops and reports the shortfall.",
+    )
+    parser.add_argument(
+        "--goal-batch",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Repos scanned per goal-mode round (default 3). Keep >=2 so "
+        "repo-scope rules (which need multiple repos) can still fire.",
+    )
+    parser.add_argument(
+        "--max-discover-rounds",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Goal mode: max --discover replenish rounds before giving up "
+        "(default 3). Bounds the loop so it always terminates.",
     )
     parser.add_argument(
         "--dry-run",
@@ -158,11 +189,17 @@ def cli() -> int:
     args = parser.parse_args()
 
     explicit_max_targets = args.max_targets is not None
+    explicit_max_runtime = args.max_runtime_seconds is not None
     if args.max_targets is None:
         args.max_targets = 3
     if args.max_runtime_seconds is None:
-        args.max_runtime_seconds = 0 if explicit_max_targets else 300
-    if explicit_max_targets:
+        # Goal mode is bounded by target exhaustion + --max-discover-rounds,
+        # so it runs without a wall-clock cap unless one is set explicitly.
+        if args.target_policies:
+            args.max_runtime_seconds = 0
+        else:
+            args.max_runtime_seconds = 0 if explicit_max_targets else 300
+    if explicit_max_targets and not args.target_policies:
         print(
             "  --max-targets set explicitly -- runtime cap disabled",
             file=sys.stderr,
@@ -232,7 +269,13 @@ def cli() -> int:
                 file=sys.stderr,
             )
 
-    if args.max_targets > 0 and len(targets) > args.max_targets:
+    # Goal mode batches through the full list itself, so the per-run cap
+    # does not apply there.
+    if (
+        not args.target_policies
+        and args.max_targets > 0
+        and len(targets) > args.max_targets
+    ):
         print(
             f"  capping targets {len(targets)} -> {args.max_targets} "
             f"(--max-targets)",
@@ -242,6 +285,9 @@ def cli() -> int:
     if not targets:
         print("no targets to scan", file=sys.stderr)
         return 1
+
+    if args.target_policies:
+        return _run_goal_loop(args, targets, rules_repo_path, trustabl_enabled)
 
     # Step 1-3: clone + scan
     hb: heartbeat.Heartbeat | None = None
@@ -269,80 +315,16 @@ def cli() -> int:
                     file=sys.stderr,
                 )
                 break
-            if hb:
-                hb.set_target(tgt["repo"])
-            try:
-                clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
-            except subprocess.CalledProcessError as exc:
-                print(f"  {tgt['repo']}: clone failed ({exc.returncode}) -- skipped",
-                      file=sys.stderr)
-                if hb:
-                    hb.target_done()
+            res = _scan_target(tgt, args, trustabl_enabled, hb)
+            if res is None:
                 continue
-            roots = [clone_path / p for p in tgt["paths"]]
-            records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
-            tgt_agents: list = []
-            tgt_subagents: list = []
-            if trustabl_enabled:
-                try:
-                    tr = trustabl_scanner.scan(tgt["repo"], clone_path)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  {tgt['repo']}: trustabl scan failed -- {exc}",
-                          file=sys.stderr)
-                else:
-                    merged = trustabl_scanner.merge_tools(records, tr.tools)
-                    added = len(merged) - len(records)
-                    records = merged
-                    tgt_agents = tr.agents
-                    tgt_subagents = tr.subagents
-                    print(
-                        f"  {tgt['repo']}: trustabl +{added} tools, "
-                        f"{len(tgt_agents)} agents, {len(tgt_subagents)} subagents",
-                        file=sys.stderr,
-                    )
-            else:
-                # Self-owned pure-Python inventory of non-tool entities.
-                tgt_agents = component_scanner.scan_agents(tgt["repo"], roots)
-                tgt_subagents = component_scanner.scan_subagents(
-                    tgt["repo"], clone_path
-                )
-            all_agents.extend(tgt_agents)
-            all_subagents.extend(tgt_subagents)
-
-            components = component_scanner.scan_components(tgt["repo"], clone_path)
-            tgt_skills = (
-                component_scanner.scan_skills(tgt["repo"], clone_path)
-                if args.enable_skills else []
-            )
-            all_skills.extend(tgt_skills)
-            has_shell = any(
-                c.startswith("subprocess.") or c in ("os.system", "os.popen")
-                for rec in records for c in rec.body_call_targets
-            )
-            all_repo_ctx.append((components, {tgt["sdk"]}, has_shell))
-
-            print(
-                f"  {tgt['repo']}: {len(records)} tools, {len(tgt_agents)} agents, "
-                f"{len(tgt_subagents)} subagents, {len(tgt_skills)} skills",
-                file=sys.stderr,
-            )
-            all_records.extend(records)
-            scanned_log.record(
-                repo=tgt["repo"],
-                ref=tgt.get("ref", "main"),
-                tools=len(records),
-                agents=len(tgt_agents),
-                subagents=len(tgt_subagents),
-            )
+            all_records.extend(res.records)
+            all_agents.extend(res.agents)
+            all_subagents.extend(res.subagents)
+            all_skills.extend(res.skills)
+            all_repo_ctx.append(res.repo_ctx)
             if not args.keep_clones:
-                clones_to_clean.append(clone_path)
-            if hb:
-                hb.add_counts(
-                    tools=len(records),
-                    agents=len(tgt_agents),
-                    subagents=len(tgt_subagents),
-                )
-                hb.target_done()
+                clones_to_clean.append(res.clone_path)
     finally:
         if hb:
             hb.stop()
@@ -551,6 +533,231 @@ def _aggregate_candidates(
         )
     out.sort(key=lambda c: c.occurrence_count, reverse=True)
     return out
+
+
+@dataclasses.dataclass
+class _ScanResult:
+    records: list
+    agents: list
+    subagents: list
+    skills: list
+    repo_ctx: tuple
+    clone_path: Path
+
+
+def _scan_target(
+    tgt: dict, args, trustabl_enabled: bool, hb: "heartbeat.Heartbeat | None"
+) -> _ScanResult | None:
+    """Clone + scan one target into tool/agent/subagent/skill/component
+    inventory. Records the scan to the scanned-log. Returns None on clone
+    failure. Caller owns clone cleanup."""
+    if hb:
+        hb.set_target(tgt["repo"])
+    try:
+        clone_path = _ensure_clone(tgt["repo"], tgt.get("ref", "main"))
+    except subprocess.CalledProcessError as exc:
+        print(f"  {tgt['repo']}: clone failed ({exc.returncode}) -- skipped",
+              file=sys.stderr)
+        if hb:
+            hb.target_done()
+        return None
+    roots = [clone_path / p for p in tgt["paths"]]
+    records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
+    tgt_agents: list = []
+    tgt_subagents: list = []
+    if trustabl_enabled:
+        try:
+            tr = trustabl_scanner.scan(tgt["repo"], clone_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {tgt['repo']}: trustabl scan failed -- {exc}",
+                  file=sys.stderr)
+        else:
+            merged = trustabl_scanner.merge_tools(records, tr.tools)
+            added = len(merged) - len(records)
+            records = merged
+            tgt_agents = tr.agents
+            tgt_subagents = tr.subagents
+            print(
+                f"  {tgt['repo']}: trustabl +{added} tools, "
+                f"{len(tgt_agents)} agents, {len(tgt_subagents)} subagents",
+                file=sys.stderr,
+            )
+    else:
+        # Self-owned pure-Python inventory of non-tool entities.
+        tgt_agents = component_scanner.scan_agents(tgt["repo"], roots)
+        tgt_subagents = component_scanner.scan_subagents(tgt["repo"], clone_path)
+
+    components = component_scanner.scan_components(tgt["repo"], clone_path)
+    tgt_skills = (
+        component_scanner.scan_skills(tgt["repo"], clone_path)
+        if args.enable_skills else []
+    )
+    has_shell = any(
+        c.startswith("subprocess.") or c in ("os.system", "os.popen")
+        for rec in records for c in rec.body_call_targets
+    )
+
+    print(
+        f"  {tgt['repo']}: {len(records)} tools, {len(tgt_agents)} agents, "
+        f"{len(tgt_subagents)} subagents, {len(tgt_skills)} skills",
+        file=sys.stderr,
+    )
+    scanned_log.record(
+        repo=tgt["repo"],
+        ref=tgt.get("ref", "main"),
+        tools=len(records),
+        agents=len(tgt_agents),
+        subagents=len(tgt_subagents),
+    )
+    if hb:
+        hb.add_counts(
+            tools=len(records),
+            agents=len(tgt_agents),
+            subagents=len(tgt_subagents),
+        )
+        hb.target_done()
+
+    return _ScanResult(
+        records=records,
+        agents=tgt_agents,
+        subagents=tgt_subagents,
+        skills=tgt_skills,
+        repo_ctx=(components, {tgt["sdk"]}, has_shell),
+        clone_path=clone_path,
+    )
+
+
+def _goal_discover(args) -> list[dict]:
+    """Replenish the target list via Sourcegraph discovery, filtered to
+    repos not already in the scanned-log. Returns [] when --discover is off
+    or nothing new is found (which lets the goal loop terminate)."""
+    if not args.discover:
+        return []
+    sdks = [args.only_sdk] if args.only_sdk else list(discover.SDK_QUERY)
+    found: list = []
+    for sdk in sdks:
+        try:
+            found.extend(discover.discover(sdk, limit=args.discover_limit))
+        except Exception as exc:  # noqa: BLE001 -- network/parse errors
+            print(f"  goal discover({sdk}): {exc}", file=sys.stderr)
+    merged, _ = discover.merge_into_targets([], found)
+    scanned = scanned_log.load()
+    return [
+        t for t in merged
+        if not scanned_log.already_scanned(
+            t["repo"], t.get("ref", "main"), scanned
+        )
+    ]
+
+
+def _run_goal_loop(
+    args, targets: list[dict], rules_repo_path: Path, trustabl_enabled: bool
+) -> int:
+    """Goal mode: scan repos in batches until N distinct policy files are
+    created. Each round cleans its clones (bounded disk) and re-derives
+    coverage (so rules written earlier silence their own candidates).
+    Terminates on goal, target exhaustion (after optional --discover
+    replenish), or an explicit runtime cap."""
+    goal = args.target_policies
+    batch_size = max(1, args.goal_batch)
+    written_rules: list[tuple[str, str]] = []
+    written_files: set[str] = set()
+    start = time.monotonic()
+    deadline = (
+        start + args.max_runtime_seconds
+        if args.max_runtime_seconds > 0 else None
+    )
+    pending = list(targets)
+    round_no = 0
+    discover_rounds = 0
+
+    while len(written_files) < goal:
+        if deadline is not None and time.monotonic() > deadline:
+            print(f"goal: runtime cap ({args.max_runtime_seconds}s) hit -- "
+                  f"stopping at {len(written_files)}/{goal} policy files",
+                  file=sys.stderr)
+            break
+        if not pending:
+            replenished = _goal_discover(args)
+            if replenished and discover_rounds < args.max_discover_rounds:
+                discover_rounds += 1
+                pending.extend(replenished)
+                print(f"  goal: discover round {discover_rounds} added "
+                      f"{len(replenished)} repos", file=sys.stderr)
+                continue
+            print(f"goal: targets exhausted -- stopping at "
+                  f"{len(written_files)}/{goal} policy files", file=sys.stderr)
+            break
+
+        round_no += 1
+        batch = pending[:batch_size]
+        pending = pending[batch_size:]
+        elapsed = int(time.monotonic() - start)
+        print(f"[goal] round {round_no}: {len(written_files)}/{goal} policy "
+              f"files, elapsed {elapsed}s, scanning {len(batch)} repos",
+              file=sys.stderr)
+
+        hb = (
+            heartbeat.Heartbeat(interval=args.heartbeat_interval)
+            if args.heartbeat_interval > 0 else None
+        )
+        if hb:
+            hb.start(targets_total=len(batch))
+        recs: list = []
+        ags: list = []
+        subs: list = []
+        sks: list = []
+        rcs: list = []
+        clones: list[Path] = []
+        try:
+            for tgt in batch:
+                res = _scan_target(tgt, args, trustabl_enabled, hb)
+                if res is None:
+                    continue
+                recs.extend(res.records)
+                ags.extend(res.agents)
+                subs.extend(res.subagents)
+                sks.extend(res.skills)
+                rcs.append(res.repo_ctx)
+                clones.append(res.clone_path)
+        finally:
+            if hb:
+                hb.stop()
+
+        covered = patterns.derive_covered_features(rules_repo_path)
+        candidates = _aggregate_candidates(
+            recs, ags, subs, sks, rcs, args.min_occurrences, covered,
+            repo_min=args.repo_min_occurrences,
+        )
+        if not candidates:
+            _cleanup_clones(clones)
+            continue
+
+        state = MiningState(
+            repo_root=rules_repo_path.resolve(),
+            dry_run=args.dry_run,
+            candidates=candidates,
+        )
+        try:
+            agent.run(state)
+        finally:
+            _cleanup_clones(clones)
+        for rule_id, path in state.written_rules:
+            written_rules.append((rule_id, path))
+            written_files.add(path)
+        print(f"  goal: round {round_no} wrote {len(state.written_rules)} "
+              f"rules; policy files now {len(written_files)}/{goal}",
+              file=sys.stderr)
+
+    print(f"\ngoal: {len(written_files)}/{goal} policy files, "
+          f"{len(written_rules)} rules:")
+    for rule_id, path in written_rules:
+        print(f"  {rule_id} -> {path}")
+    print(
+        "\nRemember to mirror these into the engine's testdata/rules-fixture/\n"
+        "per trustabl-rules CLAUDE.md step 5."
+    )
+    return 0 if len(written_files) >= goal else 1
 
 
 if __name__ == "__main__":
