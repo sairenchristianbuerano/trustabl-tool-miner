@@ -183,6 +183,13 @@ For each candidate:
      Only create a new topic file (with policy_meta) when none is a clean fit.
   3. Build the draft:
        - `scope`: the candidate's scope verbatim.
+       - `language`: the candidate's `language` verbatim (python or
+         typescript). For typescript, note in the explanation that the rule
+         is PROVISIONAL — it loads/validates but does not fire until the
+         engine's TypeScript parser ships. Omit `language` only for
+         subagent/skill scopes. If the candidate's language is `rust`, SKIP
+         it — the engine has no rust rule language yet and write_rule_yaml
+         will reject it (detection-only for now).
        - `sdk`: one of {sorted(SDK_TO_TOOL_TOKEN.keys())}.
        - `id`: matching SDK ID prefix (CSDK- / OAI- / ADK-), lowest unused
          integer in the range for the scope: 0NN for tool, 1NN for

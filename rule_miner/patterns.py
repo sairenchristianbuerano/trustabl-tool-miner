@@ -37,6 +37,19 @@ NETWORK_CALLEES = {
     "httpx.get", "httpx.post", "httpx.put", "httpx.delete",
     "httpx.patch", "httpx.head", "httpx.request",
     "urllib.request.urlopen",
+    # JS/TS HTTP callees emitted by ts_scanner.
+    "fetch", "axios", "axios.get", "axios.post", "axios.put",
+    "axios.delete", "axios.patch", "axios.request",
+    # Rust HTTP callees emitted by rust_scanner.
+    "reqwest", "reqwest.get", "reqwest.post", "reqwest.put",
+    "reqwest.delete", "reqwest.patch",
+}
+
+# Shell/process-spawn callees across languages (Python subprocess.*, JS
+# child_process / exec / spawn, Rust std::process::Command).
+SUBPROCESS_CALLEES = {
+    "execSync", "spawn", "exec", "child_process.exec",
+    "Command", "Command.new", "process.Command",
 }
 
 AMBIGUOUS_NAMES = {
@@ -65,7 +78,8 @@ FEATURE_CHECKS: dict[str, Callable[[ToolRecord], bool]] = {
         c in NETWORK_CALLEES for c in t.body_call_targets
     ),
     "calls_subprocess": lambda t: any(
-        c.startswith("subprocess.") for c in t.body_call_targets
+        c.startswith("subprocess.") or c in SUBPROCESS_CALLEES
+        for c in t.body_call_targets
     ),
     "calls_shell_true": lambda t: any(
         c in ("os.system", "os.popen") for c in t.body_call_targets
@@ -222,7 +236,13 @@ def uncovered_features(
     should always pass derived coverage in real use).
     """
     sdk_covered = (covered or {}).get(tool.sdk, set())
-    return features_present(tool) - sdk_covered
+    present = features_present(tool)
+    # Non-python tool features are namespaced "<lang>:<feature>" in coverage
+    # so a python rule doesn't silence a typescript candidate (and vice versa).
+    if getattr(tool, "language", "python") != "python":
+        lang = tool.language
+        return {f for f in present if f"{lang}:{f}" not in sdk_covered}
+    return present - sdk_covered
 
 
 def derive_covered_features(repo_root: Path) -> dict[str, set[str]]:
@@ -255,32 +275,36 @@ def derive_covered_features(repo_root: Path) -> dict[str, set[str]]:
                 applies = rule.get("applies_to") or []
                 tool_token = SDK_TO_APPLIES_TO.get(sdk)
                 is_tool_rule = not tool_token or tool_token in applies
-                _attribute_coverage(covered[sdk], match, is_tool_rule)
+                lang = rule.get("language", "python")
+                _attribute_coverage(covered[sdk], match, is_tool_rule, lang)
     return covered
 
 
 def _attribute_coverage(
-    bucket: set[str], match: dict, is_tool_rule: bool = True
+    bucket: set[str], match: dict, is_tool_rule: bool = True,
+    language: str = "python",
 ) -> None:
     keys, body_texts, param_values, pred_values = _collect_match_signals(match)
 
     # Tool-feature attribution is gated on the rule actually being a
     # tool-scope rule for this SDK's tool kind — otherwise an mcp_tool rule
     # in the same dir would wrongly mark openai_tool features covered.
+    # Non-python tool features are namespaced "<lang>:<feature>".
+    pfx = "" if language == "python" else f"{language}:"
     if is_tool_rule:
         body_blob = " ".join(body_texts)
         for feature, fragments in BODY_TEXT_SIGNATURES.items():
             if any(frag in body_blob for frag in fragments):
-                bucket.add(feature)
+                bucket.add(pfx + feature)
 
         param_blob = " ".join(param_values)
         for feature, fragments in PARAM_NAME_SIGNATURES.items():
             if any(frag in param_blob for frag in fragments):
-                bucket.add(feature)
+                bucket.add(pfx + feature)
 
         for feature, key_options in MATCH_KEY_SIGNATURES.items():
             if keys & set(key_options):
-                bucket.add(feature)
+                bucket.add(pfx + feature)
 
     # Agent/subagent coverage is namespaced and always attributed.
     _attribute_new_scope_coverage(bucket, keys, pred_values)

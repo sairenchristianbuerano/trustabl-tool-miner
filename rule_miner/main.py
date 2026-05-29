@@ -22,9 +22,11 @@ from . import (
     discover,
     heartbeat,
     patterns,
+    rust_scanner,
     scanned_log,
     scanner,
     trustabl_scanner,
+    ts_scanner,
 )
 from .component_scanner import RepoComponents
 from .tools import CandidatePattern, MiningState
@@ -508,28 +510,31 @@ def _aggregate_candidates(
     covered: dict[str, set[str]] | None = None,
     repo_min: int = 2,
 ) -> list[CandidatePattern]:
-    # bucket key: (sdk, scope, feature) -> list[(file, line, name)]
-    buckets: dict[tuple[str, str, str], list[tuple[str, int, str]]] = (
+    # bucket key: (sdk, scope, feature, language) -> list[(file, line, name)]
+    buckets: dict[tuple[str, str, str, str], list[tuple[str, int, str]]] = (
         defaultdict(list)
     )
 
     for rec in records:
+        lang = getattr(rec, "language", "python")
         for feature in patterns.uncovered_features(rec, covered):
-            buckets[(rec.sdk, "tool", feature)].append(
+            buckets[(rec.sdk, "tool", feature, lang)].append(
                 (rec.file, rec.line, rec.name)
             )
 
     for a in agents:
         present = patterns.agent_features_present(a)
         for feature in patterns.uncovered_scoped("agent", a.sdk, present, covered):
-            buckets[(a.sdk, "agent", feature)].append((a.file, a.line, a.name))
+            buckets[(a.sdk, "agent", feature, "python")].append(
+                (a.file, a.line, a.name)
+            )
 
     for s in subagents:
         present = patterns.subagent_features_present(s)
         for feature in patterns.uncovered_scoped(
             "subagent", "claude_agent_sdk", present, covered
         ):
-            buckets[("claude_agent_sdk", "subagent", feature)].append(
+            buckets[("claude_agent_sdk", "subagent", feature, "python")].append(
                 (s.file, 0, s.name)
             )
 
@@ -538,7 +543,7 @@ def _aggregate_candidates(
         for feature in patterns.uncovered_scoped(
             "skill", "claude_agent_sdk", present, covered
         ):
-            buckets[("claude_agent_sdk", "skill", feature)].append(
+            buckets[("claude_agent_sdk", "skill", feature, "python")].append(
                 (sk.file, 0, sk.name)
             )
 
@@ -548,12 +553,12 @@ def _aggregate_candidates(
             for sdk in sdks_in_repo:
                 if f"repo:{feature}" in (covered or {}).get(sdk, set()):
                     continue
-                buckets[(sdk, "repo", feature)].append(
+                buckets[(sdk, "repo", feature, "python")].append(
                     (components.repo, 0, components.repo)
                 )
 
     out: list[CandidatePattern] = []
-    for (sdk, scope, feature), locs in buckets.items():
+    for (sdk, scope, feature, language), locs in buckets.items():
         threshold = repo_min if scope == "repo" else min_occurrences
         if len(locs) < threshold:
             continue
@@ -564,6 +569,7 @@ def _aggregate_candidates(
                 occurrence_count=len(locs),
                 example_callsites=locs,
                 scope=scope,
+                language=language,
             )
         )
     out.sort(key=lambda c: c.occurrence_count, reverse=True)
@@ -598,6 +604,8 @@ def _scan_target(
         return None
     roots = [clone_path / p for p in tgt["paths"]]
     records = scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
+    records += ts_scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
+    records += rust_scanner.scan_paths(tgt["repo"], tgt["sdk"], roots)
     tgt_agents: list = []
     tgt_subagents: list = []
     if trustabl_enabled:

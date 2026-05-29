@@ -23,6 +23,13 @@ SDK_TO_TOOL_TOKEN = {
     "google_adk": "adk_function_tool",
 }
 
+# Languages the engine's rule loader accepts (schema.yaml `language:` enum).
+# A rule in any other language (e.g. rust) is rejected by the loader and would
+# break the whole pack load, so write_rule_yaml refuses it. The miner can still
+# SCAN such languages and surface candidates — it just won't draft a rule until
+# the engine adds the language (an engine schema.go change, not a miner one).
+SUPPORTED_RULE_LANGUAGES = {"python", "typescript", "javascript", "go"}
+
 # Per-scope applies_to tokens, keyed by miner-internal sdk. Values mirror the
 # engine loader's validAppliesToForScope (see schema.yaml + the rules-repo
 # CLAUDE.md "Per-scope applies_to values" tables). A drafted rule's applies_to
@@ -76,6 +83,7 @@ class CandidatePattern:
     occurrence_count: int
     example_callsites: list[tuple[str, int, str]]  # (file, line, entity_name)
     scope: str = "tool"
+    language: str = "python"
 
 
 @dataclass
@@ -96,6 +104,7 @@ def list_candidate_patterns(state: MiningState) -> str:
         {
             "sdk": c.sdk,
             "scope": c.scope,
+            "language": c.language,
             "feature": c.feature,
             "occurrences": c.occurrence_count,
             "examples": [
@@ -183,6 +192,15 @@ def write_rule_yaml(
         return (
             "REJECTED: scope must be tool|agent|subagent|repo|skill, "
             f"got {scope!r}"
+        )
+
+    language = draft.get("language", "python")
+    if scope not in {"subagent", "skill"} and language not in SUPPORTED_RULE_LANGUAGES:
+        return (
+            f"REJECTED: language {language!r} is not a supported engine rule "
+            f"language {sorted(SUPPORTED_RULE_LANGUAGES)}. The miner can scan "
+            f"it, but the engine loader would reject the rule. Add the language "
+            f"to the engine schema first."
         )
 
     allowed_tokens = valid_applies_to(sdk, scope)

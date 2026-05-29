@@ -30,6 +30,7 @@ class ToolRecord:
     has_bare_except: bool = False
     has_mutable_default: bool = False
     has_var_kwargs: bool = False
+    language: str = "python"
 
 
 def scan_paths(repo: str, sdk: str, roots: Iterable[Path]) -> list[ToolRecord]:
@@ -40,7 +41,7 @@ def scan_paths(repo: str, sdk: str, roots: Iterable[Path]) -> list[ToolRecord]:
         for py in root.rglob("*.py"):
             try:
                 tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
-            except (SyntaxError, UnicodeDecodeError):
+            except (SyntaxError, UnicodeDecodeError, OSError, ValueError):
                 continue
             records.extend(_walk(tree, repo, sdk, py))
     return records
