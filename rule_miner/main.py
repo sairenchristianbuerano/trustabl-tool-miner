@@ -125,6 +125,15 @@ def cli() -> int:
         "(default 3). Bounds the loop so it always terminates.",
     )
     parser.add_argument(
+        "--agent-idle-timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="Abort the LLM agent step if it produces no output for this many "
+        "seconds (default 300). Prevents a stalled Claude Code subprocess from "
+        "hanging the whole run; the loop moves on to the next round.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the YAML each rule would land in, do not write files.",
@@ -389,7 +398,7 @@ def cli() -> int:
         rulebook_root=rulebook_path,
     )
     try:
-        agent.run(state)
+        agent.run(state, idle_timeout=args.agent_idle_timeout)
     finally:
         _cleanup_clones(clones_to_clean)
 
@@ -803,7 +812,7 @@ def _run_goal_loop(
             rulebook_root=rulebook_path,
         )
         try:
-            agent.run(state)
+            agent.run(state, idle_timeout=args.agent_idle_timeout)
         finally:
             _cleanup_clones(clones)
         for rule_id, path in state.written_rules:

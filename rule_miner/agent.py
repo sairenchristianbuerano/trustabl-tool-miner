@@ -15,6 +15,7 @@ the agent step — no `ANTHROPIC_API_KEY` required.
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 from claude_agent_sdk import (  # type: ignore[import-not-found]
@@ -239,7 +240,7 @@ testdata/rules-fixture/ per the authoring contract step 5.
 """
 
 
-async def _run_async(state: MiningState) -> None:
+async def _run_async(state: MiningState, idle_timeout: float = 300.0) -> None:
     global _STATE
     _STATE = state
 
@@ -265,8 +266,31 @@ async def _run_async(state: MiningState) -> None:
         f"Process every candidate pattern. Rules repo: {state.repo_root}. "
         f"Dry run: {state.dry_run}. Begin by calling list_candidate_patterns."
     )
-    async for message in query(prompt=prompt, options=options):
+    # Idle watchdog: abort if the agent produces no message for idle_timeout
+    # seconds. A stalled Claude Code subprocess otherwise hangs the whole
+    # goal loop forever (query() has no built-in timeout).
+    agen = query(prompt=prompt, options=options).__aiter__()
+    while True:
+        try:
+            message = await asyncio.wait_for(
+                agen.__anext__(), timeout=idle_timeout
+            )
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            print(
+                f"  agent: no activity for {idle_timeout:.0f}s -- aborting this "
+                f"round (partial drafts kept)",
+                file=sys.stderr,
+            )
+            break
         _log(message)
+    aclose = getattr(agen, "aclose", None)
+    if aclose is not None:
+        try:
+            await aclose()
+        except Exception:  # noqa: BLE001 -- best-effort generator cleanup
+            pass
 
 
 def _log(message: object) -> None:
@@ -306,5 +330,5 @@ def _log(message: object) -> None:
     print(f"[{msg_type}] {message!r}")
 
 
-def run(state: MiningState) -> None:
-    asyncio.run(_run_async(state))
+def run(state: MiningState, idle_timeout: float = 300.0) -> None:
+    asyncio.run(_run_async(state, idle_timeout))
