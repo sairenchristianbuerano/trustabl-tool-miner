@@ -31,6 +31,7 @@ from .tools import CandidatePattern, MiningState
 
 CACHE_ROOT = Path.home() / ".cache" / "trustabl-rule-miner"
 DEFAULT_RULES_REPO_SIBLING = Path(__file__).resolve().parents[2] / "trustabl-rules"
+DEFAULT_RULEBOOK_SIBLING = Path(__file__).resolve().parents[2] / "trustabl-rulebook"
 
 
 def cli() -> int:
@@ -47,6 +48,15 @@ def cli() -> int:
         type=Path,
         help="Local path to a trustabl-rules checkout. Defaults to a sibling "
         f"directory at {DEFAULT_RULES_REPO_SIBLING}.",
+    )
+    parser.add_argument(
+        "--rulebook-repo",
+        type=Path,
+        help="Local path to a trustabl-rulebook checkout. Rationale docs are "
+        "written under <rulebook>/docs/Policy/<sdk>/<topic>.md (canonical YAML "
+        "still goes to --rules-repo). Defaults to a sibling directory at "
+        f"{DEFAULT_RULEBOOK_SIBLING}; falls back to writing docs into "
+        "--rules-repo when no rulebook is found.",
     )
     parser.add_argument(
         "--targets",
@@ -217,6 +227,7 @@ def cli() -> int:
     rules_repo_path = _resolve_rules_repo(args.rules_repo)
     if rules_repo_path is None:
         return 2
+    rulebook_path = _resolve_rulebook(args.rulebook_repo)
 
     targets = json.loads(args.targets.read_text(encoding="utf-8"))
 
@@ -287,7 +298,9 @@ def cli() -> int:
         return 1
 
     if args.target_policies:
-        return _run_goal_loop(args, targets, rules_repo_path, trustabl_enabled)
+        return _run_goal_loop(
+            args, targets, rules_repo_path, rulebook_path, trustabl_enabled
+        )
 
     # Step 1-3: clone + scan
     hb: heartbeat.Heartbeat | None = None
@@ -356,6 +369,7 @@ def cli() -> int:
         repo_root=rules_repo_path.resolve(),
         dry_run=args.dry_run,
         candidates=candidates,
+        rulebook_root=rulebook_path,
     )
     try:
         agent.run(state)
@@ -416,6 +430,27 @@ def _resolve_rules_repo(explicit: Path | None) -> Path | None:
         f"clone it next to this repo (expected at {DEFAULT_RULES_REPO_SIBLING}).",
         file=sys.stderr,
     )
+    return None
+
+
+def _resolve_rulebook(explicit: Path | None) -> Path | None:
+    """Resolve where rationale docs land. Returns None to fall back to writing
+    docs into the rules repo (with a warning)."""
+    if explicit is not None:
+        if not explicit.exists():
+            print(f"warning: --rulebook-repo path does not exist: {explicit} "
+                  "-- writing rationale docs into the rules repo instead",
+                  file=sys.stderr)
+            return None
+        print(f"using rulebook repo at {explicit}", file=sys.stderr)
+        return explicit
+    if DEFAULT_RULEBOOK_SIBLING.exists():
+        print(f"using rulebook repo at {DEFAULT_RULEBOOK_SIBLING}",
+              file=sys.stderr)
+        return DEFAULT_RULEBOOK_SIBLING
+    print("warning: no trustabl-rulebook clone found -- rationale docs will "
+          "go into the rules repo. Pass --rulebook-repo PATH to redirect.",
+          file=sys.stderr)
     return None
 
 
@@ -651,7 +686,8 @@ def _goal_discover(args) -> list[dict]:
 
 
 def _run_goal_loop(
-    args, targets: list[dict], rules_repo_path: Path, trustabl_enabled: bool
+    args, targets: list[dict], rules_repo_path: Path,
+    rulebook_path: Path | None, trustabl_enabled: bool,
 ) -> int:
     """Goal mode: scan repos in batches until N distinct policy files are
     created. Each round cleans its clones (bounded disk) and re-derives
@@ -737,6 +773,7 @@ def _run_goal_loop(
             repo_root=rules_repo_path.resolve(),
             dry_run=args.dry_run,
             candidates=candidates,
+            rulebook_root=rulebook_path,
         )
         try:
             agent.run(state)

@@ -84,6 +84,10 @@ class MiningState:
     dry_run: bool
     candidates: list[CandidatePattern] = field(default_factory=list)
     written_rules: list[tuple[str, str]] = field(default_factory=list)
+    # Where rationale docs land. Canonical YAML goes to repo_root
+    # (trustabl-rules); rationale Markdown goes to rulebook_root
+    # (trustabl-rulebook) when set, else falls back to repo_root.
+    rulebook_root: Path | None = None
 
 
 def list_candidate_patterns(state: MiningState) -> str:
@@ -234,8 +238,9 @@ def write_rule_yaml(
         return f"REJECTED: fix_type must be 'config' or 'code', got {fix_type!r}"
 
     sdk_dir_name = patterns.SDK_DIRS[sdk]
+    doc_base = state.rulebook_root or state.repo_root
     rationale_path = (
-        state.repo_root / "docs" / "Policy" / sdk_dir_name / f"{topic}.md"
+        doc_base / "docs" / "Policy" / sdk_dir_name / f"{topic}.md"
     )
 
     warnings: list[str] = []
