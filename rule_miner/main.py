@@ -142,6 +142,13 @@ def cli() -> int:
         help="Per-SDK cap on repos discovered (default: 100).",
     )
     parser.add_argument(
+        "--discover-langs",
+        default="python",
+        help="Comma-separated languages to discover repos in (default: "
+        "python). Add 'typescript' to surface TS SDK repos for the TS scanner. "
+        "Unknown (language, sdk) combos (e.g. ADK/TS, any rust) yield nothing.",
+    )
+    parser.add_argument(
         "--discover-write",
         action="store_true",
         help="With --discover, also persist the merged target list back to "
@@ -237,15 +244,23 @@ def cli() -> int:
         sdks_to_discover = (
             [args.only_sdk] if args.only_sdk else list(discover.SDK_QUERY)
         )
+        langs = [
+            la.strip() for la in args.discover_langs.split(",") if la.strip()
+        ]
         discovered: list[discover.DiscoveredTarget] = []
         for sdk in sdks_to_discover:
-            try:
-                hits = discover.discover(sdk, limit=args.discover_limit)
-            except Exception as exc:  # noqa: BLE001 -- network/parse errors
-                print(f"discover({sdk}): {exc}", file=sys.stderr)
-                continue
-            print(f"  discover({sdk}): {len(hits)} repos", file=sys.stderr)
-            discovered.extend(hits)
+            for lang in langs:
+                try:
+                    hits = discover.discover(
+                        sdk, limit=args.discover_limit, language=lang
+                    )
+                except Exception as exc:  # noqa: BLE001 -- network/parse errors
+                    print(f"discover({sdk},{lang}): {exc}", file=sys.stderr)
+                    continue
+                if hits:
+                    print(f"  discover({sdk},{lang}): {len(hits)} repos",
+                          file=sys.stderr)
+                discovered.extend(hits)
         targets, added = discover.merge_into_targets(targets, discovered)
         print(f"  added {added} new targets", file=sys.stderr)
         if args.discover_write and added:
@@ -677,12 +692,16 @@ def _goal_discover(args) -> list[dict]:
     if not args.discover:
         return []
     sdks = [args.only_sdk] if args.only_sdk else list(discover.SDK_QUERY)
+    langs = [la.strip() for la in args.discover_langs.split(",") if la.strip()]
     found: list = []
     for sdk in sdks:
-        try:
-            found.extend(discover.discover(sdk, limit=args.discover_limit))
-        except Exception as exc:  # noqa: BLE001 -- network/parse errors
-            print(f"  goal discover({sdk}): {exc}", file=sys.stderr)
+        for lang in langs:
+            try:
+                found.extend(discover.discover(
+                    sdk, limit=args.discover_limit, language=lang
+                ))
+            except Exception as exc:  # noqa: BLE001 -- network/parse errors
+                print(f"  goal discover({sdk},{lang}): {exc}", file=sys.stderr)
     merged, _ = discover.merge_into_targets([], found)
     scanned = scanned_log.load()
     return [

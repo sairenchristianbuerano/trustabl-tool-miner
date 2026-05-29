@@ -19,11 +19,24 @@ from dataclasses import dataclass
 
 SOURCEGRAPH_STREAM = "https://sourcegraph.com/.api/search/stream"
 
-SDK_QUERY = {
-    "openai_agents": "from agents import function_tool",
-    "claude_agent_sdk": "from claude_agent_sdk import tool",
-    "google_adk": "from google.adk.tools import FunctionTool",
+# Per-language content patterns that identify SDK usage. Python anchors on the
+# import line; TypeScript anchors on the published package specifier. ADK ships
+# no official TS package and none of the three ship a Rust crate, so those
+# combos are simply absent (discover returns [] for them).
+LANG_QUERY: dict[str, dict[str, str]] = {
+    "python": {
+        "openai_agents": "from agents import function_tool",
+        "claude_agent_sdk": "from claude_agent_sdk import tool",
+        "google_adk": "from google.adk.tools import FunctionTool",
+    },
+    "typescript": {
+        "openai_agents": "@openai/agents",
+        "claude_agent_sdk": "@anthropic-ai/claude-agent-sdk",
+    },
 }
+
+# Back-compat alias: callers that just want the set of SDK names.
+SDK_QUERY = LANG_QUERY["python"]
 
 # Per-SDK default ref/paths. ref="main" is the modern default; paths=["."]
 # means "scan the whole repo" since we don't know its layout.
@@ -49,11 +62,16 @@ class DiscoveredTarget:
         }
 
 
-def discover(sdk: str, limit: int = 200, timeout: float = 60.0) -> list[DiscoveredTarget]:
-    """Hit Sourcegraph for repos matching the SDK's import pattern."""
-    if sdk not in SDK_QUERY:
-        raise ValueError(f"unknown sdk {sdk!r}; expected one of {sorted(SDK_QUERY)}")
-    query = f"{SDK_QUERY[sdk]} lang:python count:{limit} select:repo"
+def discover(
+    sdk: str, limit: int = 200, timeout: float = 60.0, language: str = "python"
+) -> list[DiscoveredTarget]:
+    """Hit Sourcegraph for repos matching the SDK's import pattern in the given
+    language. Returns [] when the (language, sdk) combo has no known pattern
+    (e.g. ADK in TypeScript, or any Rust)."""
+    lang_map = LANG_QUERY.get(language)
+    if not lang_map or sdk not in lang_map:
+        return []
+    query = f"{lang_map[sdk]} lang:{language} count:{limit} select:repo"
     url = f"{SOURCEGRAPH_STREAM}?q={urllib.parse.quote(query)}"
     req = urllib.request.Request(
         url,
