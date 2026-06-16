@@ -1,0 +1,75 @@
+name: Selftest
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  security-events: write # SARIF → Code Scanning (upload-sarif default true)
+  pull-requests: write # sticky PR comment on the pull_request job
+
+# Engine pin — every selftest job pins `version: v0.1.4` (with the engine's default
+# rules) rather than `latest`, so CI is deterministic and exercises the ACTION
+# against a known engine. v0.1.4 is the release that introduced the finding
+# line-range shape (start_line/end_line) this action consumes, so it validates that
+# path end to end. It also supports the `mcp` rule category natively and loads any
+# newer rule leniently, so default rules need no compatibility pin. Bump this when a
+# newer engine release should gate the action.
+
+jobs:
+  scan-remote-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: trustabl
+        uses: ./
+        # The external target has medium+ findings, so the action exits non-zero
+        # (gating on findings, by design). This job validates plumbing only, so
+        # don't let that fail the check — the assertions below catch real breakage.
+        continue-on-error: true
+        with:
+          target: "https://github.com/openai/openai-agents-python"
+          version: "v0.1.4" # pinned — see note above
+          severity-threshold: "none"
+          risk-score-threshold: "0"
+          comment-on-pr: "false" # remote target; nothing to comment about on this PR
+      - name: Assert outputs + artifacts
+        run: |
+          echo "exit-code       = ${{ steps.trustabl.outputs.exit-code }}"
+          echo "readiness-score = ${{ steps.trustabl.outputs.readiness-score }}"
+          echo "risk-score      = ${{ steps.trustabl.outputs.risk-score }}"
+          echo "max-severity    = ${{ steps.trustabl.outputs.max-severity }}"
+          echo "findings-count  = ${{ steps.trustabl.outputs.findings-count }}"
+          echo "sarif-uploaded  = ${{ steps.trustabl.outputs.sarif-uploaded }}"
+          # Real plumbing check: the scan must have produced both artifacts and a
+          # numeric readiness score. If the action actually broke (no JSON), these fail.
+          test -f trustabl.sarif && test -f trustabl.json
+          test -n "${{ steps.trustabl.outputs.readiness-score }}"
+          test -n "${{ steps.trustabl.outputs.findings-count }}"
+  scan-self-empty:
+    # Sanity: scanning this repo (no agent SDK code) should be a clean pass (exit 0).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          target: "."
+          version: "v0.1.4"
+          comment-on-pr: "false"
+
+  scan-pr-surfaces:
+    # On pull_request, exercise the PR-only surfaces end to end (inline
+    # annotations, sticky comment, gating) against this repo's checkout (clean).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          target: "."
+          version: "v0.1.4"
+          severity-threshold: "none" # plumbing check only; don't gate the selftest PR
+          risk-score-threshold: "0"
