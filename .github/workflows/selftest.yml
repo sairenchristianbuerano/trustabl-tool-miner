@@ -49,6 +49,7 @@ jobs:
           test -f trustabl.sarif && test -f trustabl.json
           test -n "${{ steps.trustabl.outputs.readiness-score }}"
           test -n "${{ steps.trustabl.outputs.findings-count }}"
+
   scan-self-empty:
     # Sanity: scanning this repo (no agent SDK code) should be a clean pass (exit 0).
     runs-on: ubuntu-latest
