@@ -1,0 +1,24 @@
+name: Trustabl scan
+
+# Runs the published Trustabl action against this repo's checkout.
+# (This is a CONSUMER repo — it is not the action, so it uses the
+# published trustabl/trustabl-action, not a local `uses: ./`.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # SARIF → Security tab + inline PR alerts
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: trustabl/trustabl-action@v0
+        with:
+          version: v0.1.4
