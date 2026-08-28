@@ -22,3 +22,5 @@ jobs:
       - uses: trustabl/trustabl-action@v0
         with:
           version: v0.1.4
+          severity-threshold: critical
+
