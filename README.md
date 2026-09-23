@@ -1,4 +1,4 @@
-# trustabl-rule-miner
+# trustabl-rule-miner .
 
 A standalone CLI that mines official agent-SDK sample repos for **new
 policy-rule candidates** and writes draft rule YAML directly into a local
